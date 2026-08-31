@@ -2,7 +2,7 @@
 
 use core::{fmt::Debug, hint::spin_loop, ptr::NonNull};
 
-use arbitrary_int::{u2, u4};
+use arbitrary_int::{traits::Integer, u2, u4, u27};
 use bitbybit::bitfield;
 use debug_ignore::DebugIgnore;
 use volatile::{VolatileFieldAccess, VolatilePtr};
@@ -96,19 +96,34 @@ struct UsbStsReg {
 }
 
 #[bitfield(u32, debug)]
-struct UsbIntrReg {}
+struct UsbIntrReg {
+    #[bit(0, rw)]
+    usb_interrupt_enable: bool,
+    #[bit(1, rw)]
+    usb_error_interrupt_enable: bool,
+    #[bit(2, rw)]
+    port_change_interrupt_enable: bool,
+    #[bit(3, rw)]
+    frame_list_rollover_interrupt_enable: bool,
+    #[bit(4, rw)]
+    host_system_error_interrupt_enable: bool,
+    #[bit(5, rw)]
+    interrupt_on_async_advance_enable: bool,
+}
 
 #[bitfield(u32, debug)]
 struct UsbFrIndexReg {}
 
 #[bitfield(u32, debug)]
-struct PeriodicListBaseReg {}
-
-#[bitfield(u32, debug)]
 struct AsyncListAddrReg {}
 
 #[bitfield(u32, debug)]
-struct ConfigFlagReg {}
+struct ConfigFlagReg {
+    /// 0: ports routed to oHCI / uHCI controllers by default.
+    /// 1: ports routed to this controller by default.
+    #[bit(0, rw)]
+    configure_flag: bool,
+}
 
 #[bitfield(u32, debug)]
 struct PortScReg {
@@ -156,7 +171,7 @@ struct OperationalRegs {
     usb_intr: UsbIntrReg,
     fr_index: UsbFrIndexReg,
     ctrl_ds_segment: u32,
-    periodic_list_base: PeriodicListBaseReg,
+    periodic_list_base: u32,
     async_list_addr: AsyncListAddrReg,
     reserved: DebugIgnore<[u8; 36]>,
     config_flag: ConfigFlagReg,
@@ -164,21 +179,51 @@ struct OperationalRegs {
     port_sc: DebugIgnore<[PortScReg; 0]>,
 }
 
+#[bitfield(u32, debug)]
+struct PeriodicFrameListElement {
+    /// 0: valid.
+    /// 1: invalid, will not be used.
+    #[bit(0, rw)]
+    t: bool,
+    #[bits(1..=2, rw)]
+    typ: u2,
+    /// Must be set to 0.
+    #[bits(3..=4, rw)]
+    reserved: u2,
+    #[bits(5..=31, rw)]
+    addr_upper_bits: u27,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct MappedMem {
+    pub phys_addr: u64,
+    pub virt: NonNull<u8>,
+}
+
 pub struct Driver {
     capability_regs: VolatilePtr<'static, CapabilityRegs>,
     operational_regs: VolatilePtr<'static, OperationalRegs>,
     port_sc_regs: VolatilePtr<'static, [PortScReg]>,
+    periodic_frame_list_phys_addr_lower: u32,
+    periodic_frame_list: VolatilePtr<'static, [PeriodicFrameListElement; 1024]>,
 }
 
 impl Driver {
-    pub unsafe fn new(bar: NonNull<u8>) -> Self {
+    /// # Safety
+    /// The bar must be the virtual address pointing to the bar. The entire BAR 0 must be mapped with the right caching type.
+    /// The periodic frame list must be 0x1000 bytes and mapped as strong uncacheable.
+    pub unsafe fn new(
+        bar: NonNull<u8>,
+        periodic_frame_list_phys_addr: u64,
+        periodic_frame_list: NonNull<[u32; 1024]>,
+    ) -> Self {
         let capability_regs = unsafe { VolatilePtr::<CapabilityRegs>::new(bar.cast()) };
         let c = capability_regs.read();
-        log::info!("capability regs: {c:#X?}");
+        log::debug!("capability regs: {c:#X?}");
         let operational_regs =
             unsafe { VolatilePtr::new(bar.byte_offset(c.cap_len.try_into().unwrap()).cast()) };
         let o = operational_regs.read();
-        log::info!("operational regs: {o:#X?}");
+        log::debug!("operational regs: {o:#X?}");
         let n_ports = c.hcs_params.n_ports().value().try_into().unwrap();
         let port_sc_regs = unsafe {
             VolatilePtr::new(NonNull::slice_from_raw_parts(
@@ -194,6 +239,12 @@ impl Driver {
             capability_regs,
             operational_regs,
             port_sc_regs,
+            periodic_frame_list_phys_addr_lower: if c.hcc_params._64_bit_addressing_cap() {
+                periodic_frame_list_phys_addr as u32
+            } else {
+                periodic_frame_list_phys_addr.try_into().unwrap()
+            },
+            periodic_frame_list: unsafe { VolatilePtr::new(periodic_frame_list.cast()) },
         }
     }
 
@@ -217,5 +268,38 @@ impl Driver {
             spin_loop();
         }
         log::info!("Done resetting");
+
+        // Initialize CTRLDSSEGMENT
+        self.operational_regs.ctrl_ds_segment().write(
+            (self.periodic_frame_list_phys_addr_lower)
+                .try_into()
+                .unwrap(),
+        );
+        // Initialize USBINTR
+        self.operational_regs.usb_intr().update(|usb_intr| {
+            usb_intr
+                .with_usb_interrupt_enable(true)
+                .with_usb_error_interrupt_enable(true)
+                .with_port_change_interrupt_enable(true)
+                .with_host_system_error_interrupt_enable(true)
+        });
+        // Initialize the periodic frame list
+        self.periodic_frame_list.write(
+            [PeriodicFrameListElement::new_with_raw_value(Default::default())
+                .with_t(true)
+                .with_reserved(u2::ZERO); _],
+        );
+        // Initialize PERIODICLIST BASE
+        self.operational_regs
+            .periodic_list_base()
+            .write(self.periodic_frame_list_phys_addr_lower);
+        // Write to USBCMD to turn the host controller on
+        self.operational_regs
+            .usb_cmd()
+            .update(|usb_cmd| usb_cmd.with_rs(true));
+        // Initialize CONFIGFLAG
+        self.operational_regs
+            .config_flag()
+            .update(|config_flag| config_flag.with_configure_flag(true));
     }
 }
