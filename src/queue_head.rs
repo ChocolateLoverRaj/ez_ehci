@@ -1,7 +1,7 @@
-use arbitrary_int::{u2, u4, u7, u12, u20, u27};
+use arbitrary_int::{u2, u4, u7, u11, u12, u20, u27};
 use bitbybit::bitfield;
 
-use crate::transfer_token::TransferToken;
+use crate::{qtd::NextQtdPointer, transfer_token::TransferToken};
 
 #[bitfield(u32, debug)]
 pub struct QueueHeadHorizontalLinkPtr {
@@ -13,26 +13,51 @@ pub struct QueueHeadHorizontalLinkPtr {
     ptr_upper: u27,
 }
 
+impl QueueHeadHorizontalLinkPtr {
+    pub const INVALID: Self = Self::new_with_raw_value(0).with_terminate(true);
+
+    pub fn new(select_type: SelectType, ptr: u32) -> Self {
+        Self::new_with_raw_value(ptr)
+            .with_terminate(false)
+            .with_pointer_type(select_type.into())
+            .with_ptr_upper(u27::new(ptr >> 5))
+    }
+}
+
+#[repr(u8)]
+pub enum SelectType {
+    Itd,
+    Qh,
+    SplitItd,
+    Fstn,
+}
+
+impl From<SelectType> for u2 {
+    fn from(value: SelectType) -> Self {
+        Self::new(value as u8)
+    }
+}
+
 #[bitfield(u32, debug)]
 pub struct EndpointCharacteristics {
-    #[bits(0..=6)]
-    device_addr: u7,
+    #[bits(0..=6, rw)]
+    pub device_addr: u7,
     #[bit(7, rw)]
-    inactive_on_next_transaction: bool,
+    pub inactive_on_next_transaction: bool,
     #[bits(8..=11, rw)]
-    endpoint_number: u4,
+    pub endpoint_number: u4,
     #[bits(12..=13, rw)]
-    endpoint_speed: u2,
+    pub endpoint_speed: u2,
     #[bit(14, rw)]
-    data_toggle_control: bool,
+    pub data_toggle_control: bool,
     #[bit(15, rw)]
-    head_of_reclamation_list_flag: bool,
-    #[bits(16..=26)]
-    max_packet_len: u11,
+    pub head_of_reclamation_list_flag: bool,
+    #[bits(16..=26, rw)]
+    pub max_packet_len: u11,
     #[bit(27, rw)]
-    endpoint_control_flag: bool,
+    pub endpoint_control_flag: bool,
     #[bits(28..=31, rw)]
-    nak_count_reload: u4,
+    pub nak_count_reload: u4,
 }
 
 #[bitfield(u32, debug)]
@@ -44,7 +69,7 @@ pub struct EndpointCapabilities {
     #[bits(16..=22, rw)]
     hub_addr: u7,
     #[bits(23..=29, rw)]
-    pot_number: u7,
+    port_number: u7,
     #[bits(30..=31, rw)]
     high_bandwidth_pipe_multiplier: u2,
 }
@@ -55,12 +80,10 @@ pub struct CurrentQtdLinkPtr {
     ptr_upper: u27,
 }
 
-#[bitfield(u32, debug)]
-pub struct NextQtdLinkPtr {
-    #[bit(0, rw)]
-    terminate: bool,
-    #[bits(5..=31, rw)]
-    ptr_upper: u27,
+impl CurrentQtdLinkPtr {
+    pub fn new(ptr: u32) -> Self {
+        Self::new_with_raw_value(0).with_ptr_upper(u27::new(ptr >> 5))
+    }
 }
 
 #[bitfield(u32, debug)]
@@ -73,6 +96,10 @@ pub struct AlternateQtdLinkPtr {
     ptr_upper: u27,
 }
 
+impl AlternateQtdLinkPtr {
+    pub const INVALID: Self = Self::new_with_raw_value(0).with_terminate(true);
+}
+
 #[bitfield(u32, debug)]
 pub struct QhBufferPtrPage0 {
     #[bits(0..=11, rw)]
@@ -80,6 +107,8 @@ pub struct QhBufferPtrPage0 {
     #[bits(12..=31, rw)]
     ptr_upper: u20,
 }
+
+impl QhBufferPtrPage0 {}
 
 #[bitfield(u32, debug)]
 pub struct QhBufferPtrPage1 {
@@ -94,30 +123,24 @@ pub struct QhBufferPtrPage2 {
 }
 
 #[bitfield(u32, debug)]
-pub struct QhBufferPtrPage3 {
+pub struct QhBufferPtrPage3P {
     #[bits(12..=31, rw)]
     ptr_upper: u20,
 }
 
-#[bitfield(u32, debug)]
-pub struct QhBufferPtrPage4 {
-    #[bits(12..=31, rw)]
-    ptr_upper: u20,
-}
-
-#[repr(C)]
+#[repr(C, align(32))]
 #[derive(Debug, Clone, Copy)]
 pub struct QueueHead {
-    queue_head_horizontal_link_ptr: QueueHeadHorizontalLinkPtr,
-    endpoint_charactersistics: EndpointCharacteristics,
-    endpoint_capabilities: EndpointCapabilities,
-    current_qtd_pointer: CurrentQtdLinkPtr,
-    next_qtd_pointer: NextQtdLinkPtr,
-    alternate_qtd_pointer: AlternateQtdLinkPtr,
-    transfer_token: TransferToken,
-    buffer_ptr_page_0: QhBufferPtrPage0,
-    buffer_ptr_page_1: QhBufferPtrPage1,
-    buffer_ptr_page_2: QhBufferPtrPage2,
-    buffer_ptr_page_3: QhBufferPtrPage3,
-    buffer_ptr_page_4: QhBufferPtrPage4,
+    pub(crate) queue_head_horizontal_link_ptr: QueueHeadHorizontalLinkPtr,
+    pub(crate) endpoint_charactersistics: EndpointCharacteristics,
+    pub(crate) endpoint_capabilities: EndpointCapabilities,
+    pub(crate) current_qtd_pointer: CurrentQtdLinkPtr,
+    pub(crate) next_qtd_pointer: NextQtdPointer,
+    pub(crate) alternate_qtd_pointer: AlternateQtdLinkPtr,
+    pub(crate) transfer_token: TransferToken,
+    pub(crate) buffer_ptr_page_0: QhBufferPtrPage0,
+    pub(crate) buffer_ptr_page_1: QhBufferPtrPage1,
+    pub(crate) buffer_ptr_page_2: QhBufferPtrPage2,
+    pub(crate) buffer_ptr_page_3: QhBufferPtrPage3P,
+    pub(crate) buffer_ptr_page_4: QhBufferPtrPage3P,
 }

@@ -27,8 +27,37 @@ pub struct TransferToken {
     current_page: u3,
     #[bit(15, rw)]
     interrupt_on_complete: bool,
-    #[bits(16..=30)]
+    #[bits(16..=30, rw)]
     total_bytes_to_transfer: u15,
     #[bit(31, rw)]
     data_toggle: bool,
+}
+
+impl TransferToken {
+    // pub fn new_active(pid_code: PidCode) -> Self {
+    //     Self::new_with_raw_value(0)
+    //         .with_active(true)
+    //         .with_pid_code(pid_code.into())
+    // }
+
+    pub fn new_active(pid_code: PidCode, total_bytes_to_transfer: u15) -> Self {
+        Self::new_with_raw_value(0)
+            .with_active(true)
+            .with_pid_code(pid_code.into())
+            .with_total_bytes_to_transfer(total_bytes_to_transfer)
+    }
+}
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PidCode {
+    OutToken,
+    InToken,
+    SetupToken,
+}
+
+impl From<PidCode> for u2 {
+    fn from(value: PidCode) -> Self {
+        Self::new(value as u8)
+    }
 }

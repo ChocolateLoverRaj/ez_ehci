@@ -1,7 +1,7 @@
-use arbitrary_int::{u2, u3, u12, u20, u27};
+use arbitrary_int::{u12, u20, u27};
 use bitbybit::bitfield;
 
-use crate::transfer_token::TransferToken;
+use crate::{queue_head::AlternateQtdLinkPtr, transfer_token::TransferToken};
 
 #[bitfield(u32, debug)]
 pub struct NextQtdPointer {
@@ -13,25 +13,39 @@ pub struct NextQtdPointer {
     addr_upper: u27,
 }
 
+impl NextQtdPointer {
+    pub const INVALID: Self = Self::new_with_raw_value(0).with_terminate(true);
+
+    pub fn new_valid(addr: u32) -> Self {
+        Self::new_with_raw_value(0)
+            .with_terminate(false)
+            .with_addr_upper(u27::new(addr >> 5))
+    }
+}
+
 #[bitfield(u32, debug)]
-pub struct QtdBufferPagePointer {
-    /// Only used for the first buffer page pointer.
-    /// Reserved for rest.
+pub struct QtdBufferPagePointerPage0 {
     #[bits(0..=11, rw)]
-    current_offset: u12,
+    pub current_offset: u12,
+    #[bits(12..=31, rw)]
+    pub ptr_upper: u20,
+}
+
+#[bitfield(u32, debug)]
+pub struct QtdBufferPagePointerPage1Plus {
     #[bits(12..=31, rw)]
     ptr_upper: u20,
 }
 
-#[repr(C)]
+#[repr(C, align(32))]
 #[derive(Debug, Clone, Copy)]
 pub struct QueueElementTransferDescriptor {
-    next_qtd_ptr: NextQtdPointer,
-    alternate_next_qtd_ptr: NextQtdPointer,
-    qtd_token: TransferToken,
-    buffer_pointer_page_0: QtdBufferPagePointer,
-    buffer_pointer_page_1: QtdBufferPagePointer,
-    buffer_pointer_page_2: QtdBufferPagePointer,
-    buffer_pointer_page_3: QtdBufferPagePointer,
-    buffer_pointer_page_4: QtdBufferPagePointer,
+    pub(crate) next_qtd_ptr: NextQtdPointer,
+    pub(crate) alternate_next_qtd_ptr: AlternateQtdLinkPtr,
+    pub(crate) qtd_token: TransferToken,
+    pub(crate) buffer_pointer_page_0: QtdBufferPagePointerPage0,
+    pub(crate) buffer_pointer_page_1: QtdBufferPagePointerPage1Plus,
+    pub(crate) buffer_pointer_page_2: QtdBufferPagePointerPage1Plus,
+    pub(crate) buffer_pointer_page_3: QtdBufferPagePointerPage1Plus,
+    pub(crate) buffer_pointer_page_4: QtdBufferPagePointerPage1Plus,
 }

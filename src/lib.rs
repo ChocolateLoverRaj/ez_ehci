@@ -1,24 +1,44 @@
 #![no_std]
 mod capability_regs;
+mod endpoint_speed;
 mod operational_regs;
 mod periodic_list;
 mod qtd;
 mod queue_head;
 mod transfer_token;
 
-use core::{fmt::Debug, hint::spin_loop, mem::MaybeUninit, num::NonZero, ptr::NonNull};
+use core::{
+    arch::x86_64::_mm_pause,
+    fmt::Debug,
+    hint::spin_loop,
+    mem::{MaybeUninit, offset_of},
+    num::NonZero,
+    ptr::NonNull,
+};
 
-use arbitrary_int::{traits::Integer, u2, u4};
+use arbitrary_int::{traits::Integer, u2, u4, u7, u11, u12, u15, u20};
 use bitbybit::bitfield;
-use volatile::{VolatilePtr, access::ReadOnly};
+use volatile::{VolatileFieldAccess, VolatilePtr, access::ReadOnly};
 
 pub use crate::periodic_list::PeriodicFrameList;
 use crate::{
     capability_regs::{CapabilityRegs, CapabilityRegsVolatileFieldAccess},
-    operational_regs::{OperationalRegs, OperationalRegsVolatileFieldAccess, PortScReg},
+    endpoint_speed::EndpointSpeed,
+    operational_regs::{
+        AsyncListAddrReg, LineStatus, OperationalRegs, OperationalRegsVolatileFieldAccess,
+        PortScReg,
+    },
     periodic_list::PeriodicFrameListElement,
-    qtd::QueueElementTransferDescriptor,
-    queue_head::QueueHead,
+    qtd::{
+        NextQtdPointer, QtdBufferPagePointerPage0, QtdBufferPagePointerPage1Plus,
+        QueueElementTransferDescriptor,
+    },
+    queue_head::{
+        AlternateQtdLinkPtr, CurrentQtdLinkPtr, EndpointCapabilities, EndpointCharacteristics,
+        QhBufferPtrPage0, QhBufferPtrPage1, QhBufferPtrPage2, QhBufferPtrPage3P, QueueHead,
+        QueueHeadHorizontalLinkPtr, SelectType,
+    },
+    transfer_token::{PidCode, TransferToken},
 };
 
 pub const PCI_CLASS: u8 = 0x0C;
@@ -27,7 +47,7 @@ pub const PCI_PROG_IF: u8 = 0x20;
 
 #[derive(Debug, Clone, Copy)]
 pub struct MappedMem<T> {
-    pub phys_addr: u64,
+    pub phys_addr: u32,
     pub ptr: NonNull<T>,
 }
 
@@ -258,13 +278,9 @@ impl OsOwnedEhci {
             .update(|usb_cmd| usb_cmd.with_rs(true));
         log::info!("Initialized USBCMD");
         // Initialize CONFIGFLAG
-        self.operational_regs.config_flag().update(|config_flag| {
-            log::info!("Read CONNFIGFLAG");
-            config_flag.with_configure_flag(true)
-        });
-        // MMIO Read-Back Flush: Reads from the register to force the PCI bridge
-        // to complete the posted write before downstream execution continues.
-        let _ = self.operational_regs.config_flag().read();
+        self.operational_regs
+            .config_flag()
+            .update(|config_flag| config_flag.with_configure_flag(true));
         log::info!("Initialized CONFIGFLAG");
 
         InitializedEhci {
@@ -279,6 +295,25 @@ pub struct InitializedEhci {
     capability_regs: VolatilePtr<'static, CapabilityRegs, ReadOnly>,
     operational_regs: VolatilePtr<'static, OperationalRegs>,
     port_sc_regs: VolatilePtr<'static, [PortScReg]>,
+}
+
+// Align to 4 KiB and ensure size is <4 KiB to make sure buffers never cross 4 KiB boundary.
+#[repr(C, align(0x1000))]
+#[derive(Debug, VolatileFieldAccess, Clone, Copy)]
+pub struct InitDeviceBuffer {
+    qtds: [QueueElementTransferDescriptor; 3],
+    queue_head: QueueHead,
+    setup_packet_buffer: [u8; 8],
+    payload_buffer: [u8; 64],
+}
+
+#[derive(Debug)]
+pub enum InitDeviceError {
+    NotConncected,
+    /// To use this device you need to route it to a uHCI or oHCI.
+    IsLowSpeed,
+    /// To use this device you need to route it to a uHCI or oHCI.
+    IsFullSpeed,
 }
 
 impl InitializedEhci {
@@ -302,9 +337,233 @@ impl InitializedEhci {
     pub fn init_device(
         &mut self,
         root_port_number: RootPortNumber,
-        queue_head_buffer: NonNull<[u8; size_of::<QueueHead>()]>,
-        qtds_buffer: NonNull<[u8; size_of::<QueueElementTransferDescriptor>() * 3]>,
-    ) {
+        buffer: MappedMem<InitDeviceBuffer>,
+    ) -> Result<(), InitDeviceError> {
+        let port_sc_reg = self
+            .port_sc_regs
+            .index(usize::try_from(root_port_number.0.value()).unwrap());
+
+        let port_sc = port_sc_reg.read();
+        log::info!("Port SC: {port_sc:#X?}");
+        if !port_sc.connect_status_change() {
+            return Err(InitDeviceError::NotConncected);
+        }
+        if LineStatus::from(port_sc.line_status()) == LineStatus::KState {
+            // The port is Low speed
+            return Err(InitDeviceError::IsLowSpeed);
+        }
+
+        /// Busy loop delay for approximately 2ms on a ~2.4 GHz Arrandale CPU (~400,000 iterations)
+        #[inline(never)]
+        pub fn delay_approx_2ms() {
+            // 400,000 iterations * ~12 cycles/iter = ~4,800,000 cycles (~2ms)
+            for _ in 0..400_000 {
+                unsafe {
+                    _mm_pause();
+                }
+            }
+        }
+
+        /// Busy loop delay for approximately 50ms on a ~2.4 GHz Arrandale CPU (~10,000,000 iterations)
+        #[inline(never)]
+        pub fn delay_approx_50ms() {
+            // 10,000,000 iterations * ~12 cycles/iter = ~120,000,000 cycles (~50ms)
+            for _ in 0..10_000_000 {
+                unsafe {
+                    _mm_pause();
+                }
+            }
+        }
+
+        log::info!("Resetting port");
+        port_sc_reg.update(|port_sc| port_sc.with_port_reset(true).without_write_to_clear_bits());
+        delay_approx_50ms();
+        // FIXME: Wait 50ms
+        port_sc_reg.update(|port_sc| port_sc.with_port_reset(false).without_write_to_clear_bits());
+        // Wait until the port is enabled
+        log::info!("Waiting for port to be enabled");
+        // Wait up to 2 ms for the port to be enabled
+        delay_approx_2ms();
+        // TODO: Actually wait
+        if !port_sc_reg.read().port_enabled() {
+            // The port will be disabled if the device isn't high speed
+            return Err(InitDeviceError::IsFullSpeed);
+        }
+        log::info!("Port is enabled");
+        let buffer_ptr = unsafe { VolatilePtr::new(buffer.ptr) };
+        let queue_head_phys_addr =
+            buffer.phys_addr + u32::try_from(offset_of!(InitDeviceBuffer, queue_head)).unwrap();
+        buffer_ptr.write(InitDeviceBuffer {
+            qtds: [
+                QueueElementTransferDescriptor {
+                    next_qtd_ptr: NextQtdPointer::new_valid(
+                        buffer.phys_addr
+                            + u32::try_from(
+                                offset_of!(InitDeviceBuffer, qtds)
+                                    + size_of::<QueueElementTransferDescriptor>() * 1,
+                            )
+                            .unwrap(),
+                    ),
+                    alternate_next_qtd_ptr: AlternateQtdLinkPtr::INVALID,
+                    qtd_token: TransferToken::new_active(PidCode::SetupToken, u15::new(8))
+                        .with_interrupt_on_complete(true),
+                    buffer_pointer_page_0: QtdBufferPagePointerPage0::new_with_raw_value(0)
+                        .with_ptr_upper(u20::new(buffer.phys_addr >> 12))
+                        .with_current_offset(u12::new(
+                            offset_of!(InitDeviceBuffer, setup_packet_buffer)
+                                .try_into()
+                                .unwrap(),
+                        )),
+                    buffer_pointer_page_1: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
+                    buffer_pointer_page_2: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
+                    buffer_pointer_page_3: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
+                    buffer_pointer_page_4: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
+                },
+                QueueElementTransferDescriptor {
+                    next_qtd_ptr: NextQtdPointer::new_valid(
+                        buffer.phys_addr
+                            + u32::try_from(
+                                offset_of!(InitDeviceBuffer, qtds)
+                                    + size_of::<QueueElementTransferDescriptor>() * 2,
+                            )
+                            .unwrap(),
+                    ),
+                    alternate_next_qtd_ptr: AlternateQtdLinkPtr::INVALID,
+                    qtd_token: TransferToken::new_active(PidCode::InToken, u15::new(8))
+                        .with_data_toggle(true)
+                        .with_interrupt_on_complete(true),
+                    buffer_pointer_page_0: QtdBufferPagePointerPage0::new_with_raw_value(0)
+                        .with_ptr_upper(u20::new(buffer.phys_addr >> 12))
+                        .with_current_offset(u12::new(
+                            offset_of!(InitDeviceBuffer, payload_buffer)
+                                .try_into()
+                                .unwrap(),
+                        )),
+                    buffer_pointer_page_1: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
+                    buffer_pointer_page_2: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
+                    buffer_pointer_page_3: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
+                    buffer_pointer_page_4: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
+                },
+                QueueElementTransferDescriptor {
+                    next_qtd_ptr: NextQtdPointer::INVALID,
+                    alternate_next_qtd_ptr: AlternateQtdLinkPtr::INVALID,
+                    qtd_token: TransferToken::new_active(PidCode::OutToken, u15::ZERO)
+                        .with_data_toggle(true)
+                        .with_interrupt_on_complete(true),
+                    buffer_pointer_page_0: QtdBufferPagePointerPage0::new_with_raw_value(0),
+                    buffer_pointer_page_1: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
+                    buffer_pointer_page_2: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
+                    buffer_pointer_page_3: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
+                    buffer_pointer_page_4: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
+                },
+            ],
+            queue_head: QueueHead {
+                queue_head_horizontal_link_ptr: QueueHeadHorizontalLinkPtr::new(
+                    SelectType::Qh,
+                    queue_head_phys_addr,
+                ),
+                endpoint_charactersistics: EndpointCharacteristics::new_with_raw_value(0)
+                    .with_head_of_reclamation_list_flag({
+                        // This is the first item in the circular linked list of queue heads
+                        true
+                    })
+                    .with_device_addr({
+                        // new devices have address 0
+                        u7::ZERO
+                    })
+                    .with_endpoint_number({
+                        // control endpoint
+                        u4::ZERO
+                    })
+                    .with_endpoint_speed(EndpointSpeed::High.into())
+                    .with_max_packet_len(u11::new({
+                        // this is the initial max packet len used until we know the device's max packet len
+                        64
+                    })),
+                endpoint_capabilities: EndpointCapabilities::new_with_raw_value(0),
+                current_qtd_pointer: CurrentQtdLinkPtr::new_with_raw_value(0),
+                next_qtd_pointer: NextQtdPointer::new_valid(
+                    buffer.phys_addr + u32::try_from(offset_of!(InitDeviceBuffer, qtds)).unwrap(),
+                ),
+                alternate_qtd_pointer: AlternateQtdLinkPtr::INVALID,
+                transfer_token: TransferToken::new_with_raw_value(0),
+                buffer_ptr_page_0: QhBufferPtrPage0::new_with_raw_value(0),
+                buffer_ptr_page_1: QhBufferPtrPage1::new_with_raw_value(0),
+                buffer_ptr_page_2: QhBufferPtrPage2::new_with_raw_value(0),
+                buffer_ptr_page_3: QhBufferPtrPage3P::new_with_raw_value(0),
+                buffer_ptr_page_4: QhBufferPtrPage3P::new_with_raw_value(0),
+            },
+            // Standard GET_DESCRIPTOR (Device) request
+            setup_packet_buffer: [
+                0x80, // bmRequestType: Device-to-Host, Standard, Device
+                0x06, // bRequest: GET_DESCRIPTOR
+                0x00, 0x01, // wValue: Descriptor Type (0x01 = Device) & Index (0x00)
+                0x00, 0x00, // wIndex: 0
+                0x08, 0x00, // wLength: 8 bytes (initial fetch)
+            ],
+            payload_buffer: [Default::default(); _],
+        });
+        let usb_sts = self.operational_regs.usb_sts().read();
+        log::info!("USB status: {usb_sts:#X?}");
+        self.operational_regs
+            .async_list_addr()
+            .write(AsyncListAddrReg::new(queue_head_phys_addr));
+        let usb_sts = self.operational_regs.usb_sts().read();
+        log::info!("USB status: {usb_sts:#X?}");
+        self.operational_regs
+            .usb_cmd()
+            .update(|usb_cmd| usb_cmd.with_async_schedule_enable(true));
+        log::info!("Initialized and enabled async schedule.");
+        let usb_sts = self.operational_regs.usb_sts().read();
+        log::info!("USB status: {usb_sts:#X?}");
+
+        // TODO: use interrupts
+        // // Poll USB_STS for transfer complete interrupt
+        // while !self.operational_regs.usb_sts().read().usb_int() {
+        //     spin_loop();
+        // }
+        // Check first transfer
+        while buffer_ptr
+            .qtds()
+            .as_slice()
+            .index(0)
+            .read()
+            .qtd_token
+            .active()
+        {
+            let usb_sts = self.operational_regs.usb_sts().read();
+            log::debug!("USB status: {usb_sts:#X?}");
+            spin_loop();
+        }
+        log::info!("QTD 0 complete");
+        while buffer_ptr
+            .qtds()
+            .as_slice()
+            .index(1)
+            .read()
+            .qtd_token
+            .active()
+        {
+            spin_loop();
+        }
+        let mut buffer = [0u8; 64];
+        buffer_ptr
+            .payload_buffer()
+            .as_slice()
+            .copy_into_slice(&mut buffer);
+        log::info!("QTD 1 complete. Buffer: {buffer:02X?}");
+        while buffer_ptr
+            .qtds()
+            .as_slice()
+            .index(2)
+            .read()
+            .qtd_token
+            .active()
+        {
+            spin_loop();
+        }
+        log::info!("QTD 2 complete");
+        todo!()
     }
 }
 
@@ -334,7 +593,7 @@ impl<P: PciAccess> ExtendedCapabilitiesIterator<P> {
 
 #[derive(Debug, Clone, Copy)]
 struct CapabilityInfo {
-    /// Represents an offset in bytes from the end of the capability regs.
+    /// Represents an offset in bytes in the PCI configuration space.
     offset: NonZero<u8>,
     id: u8,
 }

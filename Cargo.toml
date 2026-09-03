@@ -8,4 +8,5 @@ arbitrary-int = "2.2.0"
 bitbybit = "2.0.1"
 debug-ignore = "1.0.5"
 log = "0.4.34"
+num_enum = { version = "0.7.6", default-features = false }
 volatile = { version = "0.6.1", features = ["derive", "unstable"] }
