@@ -1,4 +1,8 @@
+use core::{num::NonZero, ptr::NonNull};
+
 use bitbybit::bitfield;
+
+use crate::{OsOwnedEhci, PciAccess};
 
 #[bitfield(u32, debug)]
 pub struct UsbLegSupReg {
@@ -46,4 +50,49 @@ pub struct UsbLegCtlStsReg {
     pub smi_on_pci_command: bool,
     #[bit(31, rw)]
     pub smi_on_bar: bool,
+}
+
+pub struct BiosOwnedEhci<P: PciAccess> {
+    pub(crate) mapped_bar: NonNull<[u8]>,
+    pub(crate) pci_access: P,
+    pub(crate) usb_leg_sup_offset: NonZero<u8>,
+}
+
+impl<P: PciAccess> BiosOwnedEhci<P> {
+    pub fn take_ownership(mut self) -> TakingOwnershipEhci<P> {
+        // Write 1 to the HC OS Owned Semaphore, which is byte 3
+        // Other bits are reserved (write 0)
+        self.pci_access
+            .write_u8(self.usb_leg_sup_offset.get() + 3, 0x1);
+        TakingOwnershipEhci {
+            mapped_bar: self.mapped_bar,
+            pci_access: self.pci_access,
+            usb_leg_sup_offset: self.usb_leg_sup_offset,
+        }
+    }
+}
+
+pub struct TakingOwnershipEhci<P: PciAccess> {
+    mapped_bar: NonNull<[u8]>,
+    pci_access: P,
+    usb_leg_sup_offset: NonZero<u8>,
+}
+
+pub enum TryTakeOutput<P: PciAccess> {
+    NotYet(TakingOwnershipEhci<P>),
+    Taken(OsOwnedEhci),
+}
+
+impl<P: PciAccess> TakingOwnershipEhci<P> {
+    pub fn try_take(mut self) -> TryTakeOutput<P> {
+        // Read the HC BIOS Owned Semaphore
+        let reg = UsbLegSupReg::new_with_raw_value(
+            self.pci_access.read_u32(self.usb_leg_sup_offset.get()),
+        );
+        if reg.bios_owned_semaphore() {
+            TryTakeOutput::NotYet(self)
+        } else {
+            TryTakeOutput::Taken(unsafe { OsOwnedEhci::new(self.mapped_bar) })
+        }
+    }
 }

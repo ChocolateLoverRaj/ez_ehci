@@ -2,6 +2,7 @@
 mod capability_regs;
 mod endpoint_speed;
 mod operational_regs;
+mod pci;
 mod periodic_list;
 mod qtd;
 mod queue_head;
@@ -9,20 +10,21 @@ mod transfer_token;
 mod usb_leg_sup;
 
 use core::{
-    arch::x86_64::{_mm_clflush, _mm_pause},
+    arch::x86_64::_mm_pause,
     fmt::Debug,
     hint::spin_loop,
     mem::{MaybeUninit, offset_of},
     num::NonZero,
     ptr::NonNull,
-    sync::atomic::AtomicPtr,
 };
 
 use arbitrary_int::{traits::Integer, u2, u4, u7, u11, u12, u15, u20};
 use bitbybit::bitfield;
 use volatile::{VolatileFieldAccess, VolatilePtr, access::ReadOnly};
 
+pub use crate::pci::{PCI_CLASS, PCI_PROG_IF, PCI_SUBCLASS, PciAccess};
 pub use crate::periodic_list::PeriodicFrameList;
+pub use crate::usb_leg_sup::{BiosOwnedEhci, TakingOwnershipEhci, TryTakeOutput};
 use crate::{
     capability_regs::{CapabilityRegs, CapabilityRegsVolatileFieldAccess},
     endpoint_speed::EndpointSpeed,
@@ -33,7 +35,7 @@ use crate::{
     periodic_list::PeriodicFrameListElement,
     qtd::{
         NextQtdPointer, QtdBufferPagePointerPage0, QtdBufferPagePointerPage1Plus,
-        QueueElementTransferDescriptor, QueueElementTransferDescriptorVolatileFieldAccess,
+        QueueElementTransferDescriptor,
     },
     queue_head::{
         AlternateQtdLinkPtr, CurrentQtdLinkPtr, EndpointCapabilities, EndpointCharacteristics,
@@ -42,10 +44,6 @@ use crate::{
     },
     transfer_token::{PidCode, TransferToken},
 };
-
-pub const PCI_CLASS: u8 = 0x0C;
-pub const PCI_SUBCLASS: u8 = 0x03;
-pub const PCI_PROG_IF: u8 = 0x20;
 
 #[derive(Debug, Clone, Copy)]
 pub struct MappedMem<T> {
@@ -84,28 +82,6 @@ pub enum RunOutput {
     NewDevice(NewDeviceEvent),
 }
 
-pub trait PciAccess {
-    fn read_u32(&mut self, offset: u8) -> u32;
-    fn write_u8(&mut self, offset: u8, value: u8);
-    fn write_u16(&mut self, offset: u8, value: u16);
-    fn write_u32(&mut self, offset: u8, value: u32);
-}
-
-impl<P: PciAccess> PciAccess for &mut P {
-    fn read_u32(&mut self, offset: u8) -> u32 {
-        P::read_u32(self, offset)
-    }
-    fn write_u8(&mut self, offset: u8, value: u8) {
-        P::write_u8(self, offset, value)
-    }
-    fn write_u16(&mut self, offset: u8, value: u16) {
-        P::write_u16(self, offset, value)
-    }
-    fn write_u32(&mut self, offset: u8, value: u32) {
-        P::write_u32(self, offset, value)
-    }
-}
-
 /// # Safety
 /// - `mapped_bar` must be the virtual address pointing to the bar.
 /// - The entire BAR 0 must be mapped with the right caching type.
@@ -139,54 +115,6 @@ pub enum AnyEhci<P: PciAccess> {
     BiosOwned(BiosOwnedEhci<P>),
     OsOwned(OsOwnedEhci),
 }
-
-pub struct BiosOwnedEhci<P: PciAccess> {
-    mapped_bar: NonNull<[u8]>,
-    pci_access: P,
-    usb_leg_sup_offset: NonZero<u8>,
-}
-
-impl<P: PciAccess> BiosOwnedEhci<P> {
-    pub fn take_ownership(mut self) -> TakingOwnershipEhci<P> {
-        // Write 1 to the HC OS Owned Semaphore, which is byte 3
-        // Other bits are reserved (write 0)
-        self.pci_access
-            .write_u8(self.usb_leg_sup_offset.get() + 3, 0x1);
-        TakingOwnershipEhci {
-            mapped_bar: self.mapped_bar,
-            pci_access: self.pci_access,
-            usb_leg_sup_offset: self.usb_leg_sup_offset,
-        }
-    }
-}
-
-pub struct TakingOwnershipEhci<P: PciAccess> {
-    mapped_bar: NonNull<[u8]>,
-    pci_access: P,
-    usb_leg_sup_offset: NonZero<u8>,
-}
-
-pub enum TryTakeOutput<P: PciAccess> {
-    NotYet(TakingOwnershipEhci<P>),
-    Taken(OsOwnedEhci),
-}
-
-impl<P: PciAccess> TakingOwnershipEhci<P> {
-    pub fn try_take(mut self) -> TryTakeOutput<P> {
-        // Read the HC BIOS Owned Semaphore
-        let reg = UsbLegSupReg::new_with_raw_value(
-            self.pci_access.read_u32(self.usb_leg_sup_offset.get()),
-        );
-        if reg.bios_owned_semaphore() {
-            TryTakeOutput::NotYet(self)
-        } else {
-            self.pci_access
-                .write_u32(self.usb_leg_sup_offset.get() + 0x4, 0);
-            TryTakeOutput::Taken(unsafe { OsOwnedEhci::new(self.mapped_bar) })
-        }
-    }
-}
-
 pub struct OsOwnedEhci {
     capability_regs: VolatilePtr<'static, CapabilityRegs, ReadOnly>,
     operational_regs: VolatilePtr<'static, OperationalRegs>,
