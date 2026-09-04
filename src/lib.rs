@@ -94,7 +94,7 @@ pub struct InitDeviceBuffer {
     qtds: [QueueElementTransferDescriptor; 3],
     queue_head: QueueHead,
     setup_packet_buffer: [u8; 8],
-    payload_buffer: [u8; 8],
+    payload_buffer: [u8; 64],
 }
 
 #[derive(Debug)]
@@ -225,7 +225,7 @@ impl InitializedEhci {
                             .unwrap(),
                     ),
                     alternate_next_qtd_ptr: AlternateQtdLinkPtr::INVALID,
-                    qtd_token: TransferToken::new_active(PidCode::InToken, u15::new(8))
+                    qtd_token: TransferToken::new_active(PidCode::InToken, u15::new(64))
                         .with_data_toggle(true)
                         .with_interrupt_on_complete(true),
                     buffer_pointer_page_0: QtdBufferPagePointerPage0::new_with_raw_value(0)
@@ -309,7 +309,7 @@ impl InitializedEhci {
                 0x06, // bRequest: GET_DESCRIPTOR
                 0x00, 0x01, // wValue: Descriptor Type (0x01 = Device) & Index (0x00)
                 0x00, 0x00, // wIndex: 0
-                0x08, 0x00, // wLength: 8 bytes (initial fetch)
+                0x40, 0x00, // wLength: 64 bytes (initial fetch)
             ],
             payload_buffer: [Default::default(); _],
         });
