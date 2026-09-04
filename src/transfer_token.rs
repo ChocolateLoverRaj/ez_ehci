@@ -34,12 +34,6 @@ pub struct TransferToken {
 }
 
 impl TransferToken {
-    // pub fn new_active(pid_code: PidCode) -> Self {
-    //     Self::new_with_raw_value(0)
-    //         .with_active(true)
-    //         .with_pid_code(pid_code.into())
-    // }
-
     pub fn new_active(pid_code: PidCode, total_bytes_to_transfer: u15) -> Self {
         Self::new_with_raw_value(0)
             .with_active(true)

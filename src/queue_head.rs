@@ -143,4 +143,10 @@ pub struct QueueHead {
     pub(crate) buffer_ptr_page_2: QhBufferPtrPage2,
     pub(crate) buffer_ptr_page_3: QhBufferPtrPage3P,
     pub(crate) buffer_ptr_page_4: QhBufferPtrPage3P,
+    // Rest of fields exist if 64-bit capable
+    pub(crate) extended_buffer_ptr_page_0: u32,
+    pub(crate) extended_buffer_ptr_page_1: u32,
+    pub(crate) extended_buffer_ptr_page_2: u32,
+    pub(crate) extended_buffer_ptr_page_3: u32,
+    pub(crate) extended_buffer_ptr_page_4: u32,
 }

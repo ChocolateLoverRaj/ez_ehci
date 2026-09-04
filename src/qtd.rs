@@ -1,5 +1,6 @@
 use arbitrary_int::{u12, u20, u27};
 use bitbybit::bitfield;
+use volatile::VolatileFieldAccess;
 
 use crate::{queue_head::AlternateQtdLinkPtr, transfer_token::TransferToken};
 
@@ -38,7 +39,7 @@ pub struct QtdBufferPagePointerPage1Plus {
 }
 
 #[repr(C, align(32))]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, VolatileFieldAccess)]
 pub struct QueueElementTransferDescriptor {
     pub(crate) next_qtd_ptr: NextQtdPointer,
     pub(crate) alternate_next_qtd_ptr: AlternateQtdLinkPtr,
@@ -48,4 +49,10 @@ pub struct QueueElementTransferDescriptor {
     pub(crate) buffer_pointer_page_2: QtdBufferPagePointerPage1Plus,
     pub(crate) buffer_pointer_page_3: QtdBufferPagePointerPage1Plus,
     pub(crate) buffer_pointer_page_4: QtdBufferPagePointerPage1Plus,
+    // The remaining fields exist if 64-bit capable
+    pub(crate) extended_buffer_ptr_page_0: u32,
+    pub(crate) extended_buffer_ptr_page_1: u32,
+    pub(crate) extended_buffer_ptr_page_2: u32,
+    pub(crate) extended_buffer_ptr_page_3: u32,
+    pub(crate) extended_buffer_ptr_page_4: u32,
 }

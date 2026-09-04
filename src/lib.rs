@@ -6,14 +6,16 @@ mod periodic_list;
 mod qtd;
 mod queue_head;
 mod transfer_token;
+mod usb_leg_sup;
 
 use core::{
-    arch::x86_64::_mm_pause,
+    arch::x86_64::{_mm_clflush, _mm_pause},
     fmt::Debug,
     hint::spin_loop,
     mem::{MaybeUninit, offset_of},
     num::NonZero,
     ptr::NonNull,
+    sync::atomic::AtomicPtr,
 };
 
 use arbitrary_int::{traits::Integer, u2, u4, u7, u11, u12, u15, u20};
@@ -31,7 +33,7 @@ use crate::{
     periodic_list::PeriodicFrameListElement,
     qtd::{
         NextQtdPointer, QtdBufferPagePointerPage0, QtdBufferPagePointerPage1Plus,
-        QueueElementTransferDescriptor,
+        QueueElementTransferDescriptor, QueueElementTransferDescriptorVolatileFieldAccess,
     },
     queue_head::{
         AlternateQtdLinkPtr, CurrentQtdLinkPtr, EndpointCapabilities, EndpointCharacteristics,
@@ -85,6 +87,8 @@ pub enum RunOutput {
 pub trait PciAccess {
     fn read_u32(&mut self, offset: u8) -> u32;
     fn write_u8(&mut self, offset: u8, value: u8);
+    fn write_u16(&mut self, offset: u8, value: u16);
+    fn write_u32(&mut self, offset: u8, value: u32);
 }
 
 impl<P: PciAccess> PciAccess for &mut P {
@@ -93,6 +97,12 @@ impl<P: PciAccess> PciAccess for &mut P {
     }
     fn write_u8(&mut self, offset: u8, value: u8) {
         P::write_u8(self, offset, value)
+    }
+    fn write_u16(&mut self, offset: u8, value: u16) {
+        P::write_u16(self, offset, value)
+    }
+    fn write_u32(&mut self, offset: u8, value: u32) {
+        P::write_u32(self, offset, value)
     }
 }
 
@@ -170,6 +180,8 @@ impl<P: PciAccess> TakingOwnershipEhci<P> {
         if reg.bios_owned_semaphore() {
             TryTakeOutput::NotYet(self)
         } else {
+            self.pci_access
+                .write_u32(self.usb_leg_sup_offset.get() + 0x4, 0);
             TryTakeOutput::Taken(unsafe { OsOwnedEhci::new(self.mapped_bar) })
         }
     }
@@ -244,9 +256,7 @@ impl OsOwnedEhci {
         // Currently we only support memory in the lower 4 GiB
         // eHCI can optionaly support higher mem as long as it's all within a 4 GiB aligned region.
         // We could add support for this later.
-        self.operational_regs
-            .ctrl_ds_segment()
-            .write((0).try_into().unwrap());
+        self.operational_regs.ctrl_ds_segment().write(0);
         log::info!("Initialized CTRLDSSEGMENT");
 
         // Initialize USBINTR
@@ -304,7 +314,7 @@ pub struct InitDeviceBuffer {
     qtds: [QueueElementTransferDescriptor; 3],
     queue_head: QueueHead,
     setup_packet_buffer: [u8; 8],
-    payload_buffer: [u8; 64],
+    payload_buffer: [u8; 8],
 }
 
 #[derive(Debug)]
@@ -314,6 +324,7 @@ pub enum InitDeviceError {
     IsLowSpeed,
     /// To use this device you need to route it to a uHCI or oHCI.
     IsFullSpeed,
+    HostSystemError,
 }
 
 impl InitializedEhci {
@@ -344,8 +355,8 @@ impl InitializedEhci {
             .index(usize::try_from(root_port_number.0.value()).unwrap());
 
         let port_sc = port_sc_reg.read();
-        log::info!("Port SC: {port_sc:#X?}");
-        if !port_sc.connect_status_change() {
+        log::debug!("Port SC: {port_sc:#X?}");
+        if !port_sc.current_connect_status() {
             return Err(InitDeviceError::NotConncected);
         }
         if LineStatus::from(port_sc.line_status()) == LineStatus::KState {
@@ -383,7 +394,7 @@ impl InitializedEhci {
         // Wait until the port is enabled
         log::info!("Waiting for port to be enabled");
         // Wait up to 2 ms for the port to be enabled
-        delay_approx_2ms();
+        delay_approx_50ms();
         // TODO: Actually wait
         if !port_sc_reg.read().port_enabled() {
             // The port will be disabled if the device isn't high speed
@@ -393,6 +404,9 @@ impl InitializedEhci {
         let buffer_ptr = unsafe { VolatilePtr::new(buffer.ptr) };
         let queue_head_phys_addr =
             buffer.phys_addr + u32::try_from(offset_of!(InitDeviceBuffer, queue_head)).unwrap();
+        let next_qtd_pointer = NextQtdPointer::new_valid(
+            buffer.phys_addr + u32::try_from(offset_of!(InitDeviceBuffer, qtds)).unwrap(),
+        );
         buffer_ptr.write(InitDeviceBuffer {
             qtds: [
                 QueueElementTransferDescriptor {
@@ -404,6 +418,7 @@ impl InitializedEhci {
                             )
                             .unwrap(),
                     ),
+                    // next_qtd_ptr: NextQtdPointer::INVALID,
                     alternate_next_qtd_ptr: AlternateQtdLinkPtr::INVALID,
                     qtd_token: TransferToken::new_active(PidCode::SetupToken, u15::new(8))
                         .with_interrupt_on_complete(true),
@@ -418,6 +433,11 @@ impl InitializedEhci {
                     buffer_pointer_page_2: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
                     buffer_pointer_page_3: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
                     buffer_pointer_page_4: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
+                    extended_buffer_ptr_page_0: 0,
+                    extended_buffer_ptr_page_1: 0,
+                    extended_buffer_ptr_page_2: 0,
+                    extended_buffer_ptr_page_3: 0,
+                    extended_buffer_ptr_page_4: 0,
                 },
                 QueueElementTransferDescriptor {
                     next_qtd_ptr: NextQtdPointer::new_valid(
@@ -443,6 +463,11 @@ impl InitializedEhci {
                     buffer_pointer_page_2: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
                     buffer_pointer_page_3: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
                     buffer_pointer_page_4: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
+                    extended_buffer_ptr_page_0: 0,
+                    extended_buffer_ptr_page_1: 0,
+                    extended_buffer_ptr_page_2: 0,
+                    extended_buffer_ptr_page_3: 0,
+                    extended_buffer_ptr_page_4: 0,
                 },
                 QueueElementTransferDescriptor {
                     next_qtd_ptr: NextQtdPointer::INVALID,
@@ -455,6 +480,11 @@ impl InitializedEhci {
                     buffer_pointer_page_2: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
                     buffer_pointer_page_3: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
                     buffer_pointer_page_4: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
+                    extended_buffer_ptr_page_0: 0,
+                    extended_buffer_ptr_page_1: 0,
+                    extended_buffer_ptr_page_2: 0,
+                    extended_buffer_ptr_page_3: 0,
+                    extended_buffer_ptr_page_4: 0,
                 },
             ],
             queue_head: QueueHead {
@@ -482,9 +512,8 @@ impl InitializedEhci {
                     })),
                 endpoint_capabilities: EndpointCapabilities::new_with_raw_value(0),
                 current_qtd_pointer: CurrentQtdLinkPtr::new_with_raw_value(0),
-                next_qtd_pointer: NextQtdPointer::new_valid(
-                    buffer.phys_addr + u32::try_from(offset_of!(InitDeviceBuffer, qtds)).unwrap(),
-                ),
+                next_qtd_pointer,
+                // next_qtd_pointer: NextQtdPointer::INVALID,
                 alternate_qtd_pointer: AlternateQtdLinkPtr::INVALID,
                 transfer_token: TransferToken::new_with_raw_value(0),
                 buffer_ptr_page_0: QhBufferPtrPage0::new_with_raw_value(0),
@@ -492,6 +521,11 @@ impl InitializedEhci {
                 buffer_ptr_page_2: QhBufferPtrPage2::new_with_raw_value(0),
                 buffer_ptr_page_3: QhBufferPtrPage3P::new_with_raw_value(0),
                 buffer_ptr_page_4: QhBufferPtrPage3P::new_with_raw_value(0),
+                extended_buffer_ptr_page_0: 0,
+                extended_buffer_ptr_page_1: 0,
+                extended_buffer_ptr_page_2: 0,
+                extended_buffer_ptr_page_3: 0,
+                extended_buffer_ptr_page_4: 0,
             },
             // Standard GET_DESCRIPTOR (Device) request
             setup_packet_buffer: [
@@ -503,19 +537,19 @@ impl InitializedEhci {
             ],
             payload_buffer: [Default::default(); _],
         });
-        let usb_sts = self.operational_regs.usb_sts().read();
-        log::info!("USB status: {usb_sts:#X?}");
-        self.operational_regs
-            .async_list_addr()
-            .write(AsyncListAddrReg::new(queue_head_phys_addr));
-        let usb_sts = self.operational_regs.usb_sts().read();
-        log::info!("USB status: {usb_sts:#X?}");
+        let value = AsyncListAddrReg::new(queue_head_phys_addr);
+        self.operational_regs.async_list_addr().write(value);
+        // let usb_sts = self.operational_regs.usb_sts().read();
+        // log::info!("USB status: {usb_sts:#X?}");
         self.operational_regs
             .usb_cmd()
             .update(|usb_cmd| usb_cmd.with_async_schedule_enable(true));
         log::info!("Initialized and enabled async schedule.");
         let usb_sts = self.operational_regs.usb_sts().read();
-        log::info!("USB status: {usb_sts:#X?}");
+        if usb_sts.host_system_error() {
+            log::error!("USB status: {usb_sts:#X?}");
+            return Err(InitDeviceError::HostSystemError);
+        }
 
         // TODO: use interrupts
         // // Poll USB_STS for transfer complete interrupt
@@ -546,11 +580,7 @@ impl InitializedEhci {
         {
             spin_loop();
         }
-        let mut buffer = [0u8; 64];
-        buffer_ptr
-            .payload_buffer()
-            .as_slice()
-            .copy_into_slice(&mut buffer);
+        let buffer = buffer_ptr.payload_buffer().read();
         log::info!("QTD 1 complete. Buffer: {buffer:02X?}");
         while buffer_ptr
             .qtds()
