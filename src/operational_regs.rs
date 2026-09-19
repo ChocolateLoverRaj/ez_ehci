@@ -13,8 +13,16 @@ pub struct UsbCmdReg {
     /// write 1 to reset, then wait for value to become 0, which indicates it's done resetting.
     #[bit(1, rw)]
     pub hc_reset: bool,
+    #[bits(2..=3, rw)]
+    pub frame_list_size: u2,
+    #[bit(4, rw)]
+    pub periodic_schedule_enable: bool,
     #[bit(5, rw)]
-    async_schedule_enable: bool,
+    pub async_schedule_enable: bool,
+    #[bit(6, rw)]
+    pub interrupt_on_async_advance_doorbell: bool,
+    #[bit(7, rw)]
+    pub light_host_controller_reset: bool,
 }
 
 #[bitfield(u32, debug)]
@@ -29,6 +37,8 @@ pub struct UsbStsReg {
     pub frame_list_rollover: bool,
     #[bit(4, rw)]
     pub host_system_error: bool,
+    #[bit(5, rw)]
+    pub interrupt_on_async_advance: bool,
     #[bit(12, r)]
     pub hc_halted: bool,
     #[bit(14, r)]

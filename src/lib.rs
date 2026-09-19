@@ -8,22 +8,32 @@ mod pci;
 mod periodic_list;
 mod qtd;
 mod queue_head;
+mod setup_packet;
 mod transfer_token;
 mod usb_leg_sup;
 
-use core::{
-    arch::x86_64::_mm_pause, fmt::Debug, hint::spin_loop, mem::offset_of, num::NonZero,
-    ptr::NonNull,
-};
+use core::future;
+use core::pin::pin;
+use core::sync::atomic::{AtomicBool, Ordering};
+use core::task::Poll;
+use core::{fmt::Debug, mem::offset_of, num::NonZero, ptr::NonNull};
 
 use arbitrary_int::{traits::Integer, u4, u7, u11, u12, u15, u20};
 use bitbybit::bitfield;
+use embedded_hal_async::delay::DelayNs;
+use futures::future::{Either, select};
+use futures::task::AtomicWaker;
 use volatile::{VolatileFieldAccess, VolatilePtr, access::ReadOnly};
+use zerocopy::transmute;
 
 pub use crate::new_ehci::{AnyEhci, new_ehci};
+use crate::operational_regs::UsbStsReg;
 pub use crate::os_owned_ehci::OsOwnedEhci;
 pub use crate::pci::{PCI_CLASS, PCI_PROG_IF, PCI_SUBCLASS, PciAccess};
 pub use crate::periodic_list::PeriodicFrameList;
+use crate::qtd::QueueElementTransferDescriptorVolatileFieldAccess;
+use crate::queue_head::QueueHeadVolatileFieldAccess;
+use crate::setup_packet::SetupPacket;
 pub use crate::usb_leg_sup::{BiosOwnedEhci, TakingOwnershipEhci, TryTakeOutput};
 use crate::{
     capability_regs::{CapabilityRegs, CapabilityRegsVolatileFieldAccess},
@@ -85,16 +95,26 @@ pub struct InitializedEhci {
     capability_regs: VolatilePtr<'static, CapabilityRegs, ReadOnly>,
     operational_regs: VolatilePtr<'static, OperationalRegs>,
     port_sc_regs: VolatilePtr<'static, [PortScReg]>,
+    int_occurred: AtomicBool,
+    waker: AtomicWaker,
+    async_advance_occurred: AtomicBool,
 }
 
+/// Safety: safe to drop in different thread than it was created in.
+unsafe impl Send for InitializedEhci {}
+/// Safety: safe for multiple threads to have a reference to this.
+unsafe impl Sync for InitializedEhci {}
+
+const PAYLOAD_BUFFER_LEN: usize = 64;
 // Align to 4 KiB and ensure size is <4 KiB to make sure buffers never cross 4 KiB boundary.
 #[repr(C, align(0x1000))]
 #[derive(Debug, VolatileFieldAccess, Clone, Copy)]
 pub struct InitDeviceBuffer {
-    qtds: [QueueElementTransferDescriptor; 3],
-    queue_head: QueueHead,
-    setup_packet_buffer: [u8; 8],
-    payload_buffer: [u8; 64],
+    qtds: [QueueElementTransferDescriptor; 5],
+    qhs: [QueueHead; 2],
+    set_address_setup_packet: [u8; 8],
+    get_descriptor_setup_packet: [u8; 8],
+    descriptor_buffer: [u8; PAYLOAD_BUFFER_LEN],
 }
 
 #[derive(Debug)]
@@ -108,7 +128,7 @@ pub enum InitDeviceError {
 }
 
 impl InitializedEhci {
-    pub fn run(&mut self) -> RunOutput {
+    pub fn run(&self) -> RunOutput {
         // Check for devices
         for port in 0..self.capability_regs.hcs_params().read().n_ports().value() {
             log::info!("checking port {port}");
@@ -125,11 +145,57 @@ impl InitializedEhci {
         RunOutput::Idle
     }
 
-    pub fn init_device(
-        &mut self,
+    pub fn handle_interrupt(&self) {
+        let status = self.operational_regs.usb_sts().read();
+        log::info!("eHCI interrupt. Status: {status:#X?}");
+        // TODO: This can make us exit our 2ms wait early.
+        let mut clear = UsbStsReg::new_with_raw_value(0).with_frame_list_rollover(true);
+        if status.usb_err_int() {
+            panic!("usb err int");
+        } else if status.host_system_error() {
+            panic!("host system error");
+        }
+        if status.interrupt_on_async_advance() {
+            self.async_advance_occurred.store(true, Ordering::Relaxed);
+            self.waker.wake();
+            clear.set_interrupt_on_async_advance(true);
+        }
+        if status.port_change_detect() | status.usb_int() {
+            self.int_occurred.store(true, Ordering::Relaxed);
+            self.waker.wake();
+            clear.set_port_change_detect(true);
+            clear.set_usb_int(true);
+        }
+        self.operational_regs.usb_sts().write(clear);
+
+        for port in 0..self.capability_regs.hcs_params().read().n_ports().value() {
+            let port_sc_reg_ptr = self.port_sc_regs.index(usize::try_from(port).unwrap());
+            let port_sc_reg = port_sc_reg_ptr.read();
+            if port_sc_reg.connect_status_change() {
+                log::info!("port {port} connect status changed");
+            }
+            if port_sc_reg.port_enable_change() {
+                log::info!("port {port} port enable changed");
+            }
+            if port_sc_reg.over_current_change() {
+                log::info!("port {port} over current change");
+            }
+            // Clear interrupts
+            port_sc_reg_ptr.write(port_sc_reg);
+        }
+    }
+
+    pub async fn init_device(
+        &self,
         root_port_number: RootPortNumber,
         buffer: MappedMem<InitDeviceBuffer>,
+        delay: &mut impl DelayNs,
     ) -> Result<(), InitDeviceError> {
+        for _ in 0..10 {
+            delay.delay_ms(2).await;
+            log::info!("did test delay");
+        }
+
         let port_sc_reg = self
             .port_sc_regs
             .index(usize::try_from(root_port_number.0.value()).unwrap());
@@ -143,177 +209,145 @@ impl InitializedEhci {
             // The port is Low speed
             return Err(InitDeviceError::IsLowSpeed);
         }
-
-        /// Busy loop delay for approximately 2ms on a ~2.4 GHz Arrandale CPU (~400,000 iterations)
-        #[inline(never)]
-        pub fn delay_approx_2ms() {
-            // 400,000 iterations * ~12 cycles/iter = ~4,800,000 cycles (~2ms)
-            for _ in 0..400_000 {
-                _mm_pause();
-            }
-        }
-
-        /// Busy loop delay for approximately 50ms on a ~2.4 GHz Arrandale CPU (~10,000,000 iterations)
-        #[inline(never)]
-        pub fn delay_approx_50ms() {
-            // 10,000,000 iterations * ~12 cycles/iter = ~120,000,000 cycles (~50ms)
-            for _ in 0..10_000_000 {
-                _mm_pause();
-            }
-        }
-
-        log::info!("Resetting port");
+        log::debug!("Resetting port");
         port_sc_reg.update(|port_sc| port_sc.with_port_reset(true).without_write_to_clear_bits());
-        delay_approx_50ms();
-        // FIXME: Wait 50ms
+        delay.delay_ms(50).await;
         port_sc_reg.update(|port_sc| port_sc.with_port_reset(false).without_write_to_clear_bits());
         // Wait until the port is enabled
         log::info!("Waiting for port to be enabled");
-        // Wait up to 2 ms for the port to be enabled
-        delay_approx_2ms();
-        // TODO: Actually wait
-        if !port_sc_reg.read().port_enabled() {
+        delay.delay_ms(2).await;
+        log::info!("delay of 2ms done");
+        // let timeout = delay.delay_ms(2);
+        // let mut timeout_pinned = pin!(timeout);
+        // let port_enabled = loop {
+        //     let int_future = future::poll_fn(|context| {
+        //         self.waker.register(context.waker());
+        //         if self.int_occurred.swap(false, Ordering::Relaxed) {
+        //             return Poll::Ready(());
+        //         }
+        //         Poll::Pending
+        //     });
+        //     match select(timeout_pinned, int_future).await {
+        //         Either::Left(_) => {
+        //             log::info!("2ms timer over, checking if port enabled");
+        //             break port_sc_reg.read().port_enabled();
+        //         }
+        //         Either::Right((_, r_timeout)) => {
+        //             if port_sc_reg.read().port_enabled() {
+        //                 log::info!("port enabled, detected from interrupt");
+        //                 break true;
+        //             }
+        //             timeout_pinned = r_timeout;
+        //         }
+        //     }
+        // };
+        let port_enabled = port_sc_reg.read().port_enabled();
+        if !port_enabled {
             // The port will be disabled if the device isn't high speed
             return Err(InitDeviceError::IsFullSpeed);
         }
         log::info!("Port is enabled");
+
+        let addr_to_set = u7::new(0x67);
         let buffer_ptr = unsafe { VolatilePtr::new(buffer.ptr) };
-        let queue_head_phys_addr =
-            buffer.phys_addr + u32::try_from(offset_of!(InitDeviceBuffer, queue_head)).unwrap();
-        let next_qtd_pointer = NextQtdPointer::new_valid(
-            buffer.phys_addr + u32::try_from(offset_of!(InitDeviceBuffer, qtds)).unwrap(),
-        );
-        buffer_ptr.write(InitDeviceBuffer {
-            qtds: [
-                QueueElementTransferDescriptor {
-                    next_qtd_ptr: NextQtdPointer::new_valid(
-                        buffer.phys_addr
-                            + u32::try_from(
-                                offset_of!(InitDeviceBuffer, qtds)
-                                    + size_of::<QueueElementTransferDescriptor>() * 1,
-                            )
+        let qhs_phys_addr =
+            buffer.phys_addr + u32::try_from(offset_of!(InitDeviceBuffer, qhs)).unwrap();
+        let qh_size = u32::try_from(size_of::<QueueHead>()).unwrap();
+        let qtds_addr =
+            buffer.phys_addr + u32::try_from(offset_of!(InitDeviceBuffer, qtds)).unwrap();
+        let qtd_size = u32::try_from(size_of::<QueueElementTransferDescriptor>()).unwrap();
+        // First transfer: set address
+        buffer_ptr
+            .qtds()
+            .as_slice()
+            .index(0)
+            .write(QueueElementTransferDescriptor {
+                next_qtd_ptr: NextQtdPointer::new_valid(qtds_addr + qtd_size * 1),
+                alternate_next_qtd_ptr: AlternateQtdLinkPtr::INVALID,
+                qtd_token: TransferToken::new_active(PidCode::SetupToken, u15::new(8))
+                    .with_interrupt_on_complete(true),
+                buffer_pointer_page_0: QtdBufferPagePointerPage0::new_with_raw_value(0)
+                    .with_ptr_upper(u20::new(buffer.phys_addr >> 12))
+                    .with_current_offset(u12::new(
+                        offset_of!(InitDeviceBuffer, set_address_setup_packet)
+                            .try_into()
                             .unwrap(),
-                    ),
-                    // next_qtd_ptr: NextQtdPointer::INVALID,
-                    alternate_next_qtd_ptr: AlternateQtdLinkPtr::INVALID,
-                    qtd_token: TransferToken::new_active(PidCode::SetupToken, u15::new(8))
-                        .with_interrupt_on_complete(true),
-                    buffer_pointer_page_0: QtdBufferPagePointerPage0::new_with_raw_value(0)
-                        .with_ptr_upper(u20::new(buffer.phys_addr >> 12))
-                        .with_current_offset(u12::new(
-                            offset_of!(InitDeviceBuffer, setup_packet_buffer)
-                                .try_into()
-                                .unwrap(),
-                        )),
-                    buffer_pointer_page_1: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
-                    buffer_pointer_page_2: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
-                    buffer_pointer_page_3: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
-                    buffer_pointer_page_4: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
-                    extended_buffer_ptr_page_0: 0,
-                    extended_buffer_ptr_page_1: 0,
-                    extended_buffer_ptr_page_2: 0,
-                    extended_buffer_ptr_page_3: 0,
-                    extended_buffer_ptr_page_4: 0,
-                },
-                QueueElementTransferDescriptor {
-                    next_qtd_ptr: NextQtdPointer::new_valid(
-                        buffer.phys_addr
-                            + u32::try_from(
-                                offset_of!(InitDeviceBuffer, qtds)
-                                    + size_of::<QueueElementTransferDescriptor>() * 2,
-                            )
-                            .unwrap(),
-                    ),
-                    alternate_next_qtd_ptr: AlternateQtdLinkPtr::INVALID,
-                    qtd_token: TransferToken::new_active(PidCode::InToken, u15::new(64))
-                        .with_data_toggle(true)
-                        .with_interrupt_on_complete(true),
-                    buffer_pointer_page_0: QtdBufferPagePointerPage0::new_with_raw_value(0)
-                        .with_ptr_upper(u20::new(buffer.phys_addr >> 12))
-                        .with_current_offset(u12::new(
-                            offset_of!(InitDeviceBuffer, payload_buffer)
-                                .try_into()
-                                .unwrap(),
-                        )),
-                    buffer_pointer_page_1: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
-                    buffer_pointer_page_2: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
-                    buffer_pointer_page_3: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
-                    buffer_pointer_page_4: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
-                    extended_buffer_ptr_page_0: 0,
-                    extended_buffer_ptr_page_1: 0,
-                    extended_buffer_ptr_page_2: 0,
-                    extended_buffer_ptr_page_3: 0,
-                    extended_buffer_ptr_page_4: 0,
-                },
-                QueueElementTransferDescriptor {
-                    next_qtd_ptr: NextQtdPointer::INVALID,
-                    alternate_next_qtd_ptr: AlternateQtdLinkPtr::INVALID,
-                    qtd_token: TransferToken::new_active(PidCode::OutToken, u15::ZERO)
-                        .with_data_toggle(true)
-                        .with_interrupt_on_complete(true),
-                    buffer_pointer_page_0: QtdBufferPagePointerPage0::new_with_raw_value(0),
-                    buffer_pointer_page_1: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
-                    buffer_pointer_page_2: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
-                    buffer_pointer_page_3: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
-                    buffer_pointer_page_4: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
-                    extended_buffer_ptr_page_0: 0,
-                    extended_buffer_ptr_page_1: 0,
-                    extended_buffer_ptr_page_2: 0,
-                    extended_buffer_ptr_page_3: 0,
-                    extended_buffer_ptr_page_4: 0,
-                },
-            ],
-            queue_head: QueueHead {
-                queue_head_horizontal_link_ptr: QueueHeadHorizontalLinkPtr::new(
-                    SelectType::Qh,
-                    queue_head_phys_addr,
-                ),
-                endpoint_charactersistics: EndpointCharacteristics::new_with_raw_value(0)
-                    .with_head_of_reclamation_list_flag({
-                        // This is the first item in the circular linked list of queue heads
-                        true
-                    })
-                    .with_device_addr({
-                        // new devices have address 0
-                        u7::ZERO
-                    })
-                    .with_endpoint_number({
-                        // control endpoint
-                        u4::ZERO
-                    })
-                    .with_endpoint_speed(EndpointSpeed::High.into())
-                    .with_max_packet_len(u11::new({
-                        // this is the initial max packet len used until we know the device's max packet len
-                        64
-                    })),
-                endpoint_capabilities: EndpointCapabilities::new_with_raw_value(0),
-                current_qtd_pointer: CurrentQtdLinkPtr::new_with_raw_value(0),
-                next_qtd_pointer,
-                // next_qtd_pointer: NextQtdPointer::INVALID,
-                alternate_qtd_pointer: AlternateQtdLinkPtr::INVALID,
-                transfer_token: TransferToken::new_with_raw_value(0),
-                buffer_ptr_page_0: QhBufferPtrPage0::new_with_raw_value(0),
-                buffer_ptr_page_1: QhBufferPtrPage1::new_with_raw_value(0),
-                buffer_ptr_page_2: QhBufferPtrPage2::new_with_raw_value(0),
-                buffer_ptr_page_3: QhBufferPtrPage3P::new_with_raw_value(0),
-                buffer_ptr_page_4: QhBufferPtrPage3P::new_with_raw_value(0),
+                    )),
+                buffer_pointer_page_1: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
+                buffer_pointer_page_2: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
+                buffer_pointer_page_3: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
+                buffer_pointer_page_4: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
                 extended_buffer_ptr_page_0: 0,
                 extended_buffer_ptr_page_1: 0,
                 extended_buffer_ptr_page_2: 0,
                 extended_buffer_ptr_page_3: 0,
                 extended_buffer_ptr_page_4: 0,
-            },
-            // Standard GET_DESCRIPTOR (Device) request
-            setup_packet_buffer: [
-                0x80, // bmRequestType: Device-to-Host, Standard, Device
-                0x06, // bRequest: GET_DESCRIPTOR
-                0x00, 0x01, // wValue: Descriptor Type (0x01 = Device) & Index (0x00)
-                0x00, 0x00, // wIndex: 0
-                0x40, 0x00, // wLength: 64 bytes (initial fetch)
-            ],
-            payload_buffer: [Default::default(); _],
+            });
+        buffer_ptr
+            .qtds()
+            .as_slice()
+            .index(1)
+            .write(QueueElementTransferDescriptor {
+                next_qtd_ptr: NextQtdPointer::INVALID,
+                alternate_next_qtd_ptr: AlternateQtdLinkPtr::INVALID,
+                qtd_token: TransferToken::new_active(PidCode::InToken, u15::ZERO)
+                    .with_interrupt_on_complete(true)
+                    .with_data_toggle(true),
+                buffer_pointer_page_0: QtdBufferPagePointerPage0::new_with_raw_value(0),
+                buffer_pointer_page_1: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
+                buffer_pointer_page_2: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
+                buffer_pointer_page_3: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
+                buffer_pointer_page_4: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
+                extended_buffer_ptr_page_0: 0,
+                extended_buffer_ptr_page_1: 0,
+                extended_buffer_ptr_page_2: 0,
+                extended_buffer_ptr_page_3: 0,
+                extended_buffer_ptr_page_4: 0,
+            });
+        buffer_ptr.qhs().as_slice().index(0).write(QueueHead {
+            queue_head_horizontal_link_ptr: QueueHeadHorizontalLinkPtr::new(
+                SelectType::Qh,
+                qhs_phys_addr,
+            ),
+            endpoint_charactersistics: EndpointCharacteristics::new_with_raw_value(0)
+                .with_head_of_reclamation_list_flag({
+                    // This is the first item in the circular linked list of queue heads
+                    true
+                })
+                .with_device_addr({
+                    // new devices have address 0
+                    u7::ZERO
+                })
+                .with_endpoint_number({
+                    // control endpoint
+                    u4::ZERO
+                })
+                .with_endpoint_speed(EndpointSpeed::High.into())
+                .with_max_packet_len(u11::new({
+                    // this is the initial max packet len used until we know the device's max packet len
+                    PAYLOAD_BUFFER_LEN.try_into().unwrap()
+                })),
+            endpoint_capabilities: EndpointCapabilities::new_with_raw_value(0),
+            current_qtd_pointer: CurrentQtdLinkPtr::new_with_raw_value(0),
+            next_qtd_pointer: NextQtdPointer::new_valid(qtds_addr + qtd_size * 0),
+            // next_qtd_pointer: NextQtdPointer::INVALID,
+            alternate_qtd_pointer: AlternateQtdLinkPtr::INVALID,
+            transfer_token: TransferToken::new_with_raw_value(0),
+            buffer_ptr_page_0: QhBufferPtrPage0::new_with_raw_value(0),
+            buffer_ptr_page_1: QhBufferPtrPage1::new_with_raw_value(0),
+            buffer_ptr_page_2: QhBufferPtrPage2::new_with_raw_value(0),
+            buffer_ptr_page_3: QhBufferPtrPage3P::new_with_raw_value(0),
+            buffer_ptr_page_4: QhBufferPtrPage3P::new_with_raw_value(0),
+            extended_buffer_ptr_page_0: 0,
+            extended_buffer_ptr_page_1: 0,
+            extended_buffer_ptr_page_2: 0,
+            extended_buffer_ptr_page_3: 0,
+            extended_buffer_ptr_page_4: 0,
         });
-        let value = AsyncListAddrReg::new(queue_head_phys_addr);
+        buffer_ptr
+            .set_address_setup_packet()
+            .write(transmute!(SetupPacket::new_set_address(addr_to_set)));
+        let value = AsyncListAddrReg::new(qhs_phys_addr);
         self.operational_regs.async_list_addr().write(value);
         // let usb_sts = self.operational_regs.usb_sts().read();
         // log::info!("USB status: {usb_sts:#X?}");
@@ -327,7 +361,6 @@ impl InitializedEhci {
             return Err(InitDeviceError::HostSystemError);
         }
 
-        // TODO: use interrupts
         while buffer_ptr
             .qtds()
             .as_slice()
@@ -336,7 +369,15 @@ impl InitializedEhci {
             .qtd_token
             .active()
         {
-            spin_loop();
+            log::info!("awaiting usb int future");
+            future::poll_fn(|context| {
+                self.waker.register(context.waker());
+                if self.int_occurred.swap(false, Ordering::Relaxed) {
+                    return Poll::Ready(());
+                }
+                Poll::Pending
+            })
+            .await;
         }
         log::info!("QTD 0 complete");
         while buffer_ptr
@@ -347,10 +388,160 @@ impl InitializedEhci {
             .qtd_token
             .active()
         {
-            spin_loop();
+            log::info!("awaiting usb int future");
+            future::poll_fn(|context| {
+                self.waker.register(context.waker());
+                if self.int_occurred.swap(false, Ordering::Relaxed) {
+                    return Poll::Ready(());
+                }
+                Poll::Pending
+            })
+            .await;
         }
-        let buffer = buffer_ptr.payload_buffer().read();
-        log::info!("QTD 1 complete. Buffer: {buffer:02X?}");
+        log::info!("QTD 1 complete");
+
+        delay.delay_ms(2).await;
+
+        // self.operational_regs
+        //     .usb_cmd()
+        //     .update(|usb_cmd| usb_cmd.with_interrupt_on_async_advance_doorbell(true));
+        // log::info!("waiting for interrupt on async advance");
+        // future::poll_fn(|context| {
+        //     self.waker.register(context.waker());
+        //     if self.async_advance_occurred.swap(false, Ordering::Relaxed) {
+        //         return Poll::Ready(());
+        //     }
+        //     Poll::Pending
+        // })
+        // .await;
+
+        log::info!("Doing get descriptor");
+        // Next transfer: get descriptor
+        buffer_ptr
+            .qtds()
+            .as_slice()
+            .index(2)
+            .write(QueueElementTransferDescriptor {
+                next_qtd_ptr: NextQtdPointer::new_valid(qtds_addr + qtd_size * 3),
+                alternate_next_qtd_ptr: AlternateQtdLinkPtr::INVALID,
+                qtd_token: TransferToken::new_active(PidCode::SetupToken, u15::new(8))
+                    .with_interrupt_on_complete(true),
+                buffer_pointer_page_0: QtdBufferPagePointerPage0::new_with_raw_value(0)
+                    .with_ptr_upper(u20::new(buffer.phys_addr >> 12))
+                    .with_current_offset(u12::new(
+                        offset_of!(InitDeviceBuffer, get_descriptor_setup_packet)
+                            .try_into()
+                            .unwrap(),
+                    )),
+                buffer_pointer_page_1: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
+                buffer_pointer_page_2: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
+                buffer_pointer_page_3: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
+                buffer_pointer_page_4: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
+                extended_buffer_ptr_page_0: 0,
+                extended_buffer_ptr_page_1: 0,
+                extended_buffer_ptr_page_2: 0,
+                extended_buffer_ptr_page_3: 0,
+                extended_buffer_ptr_page_4: 0,
+            });
+        buffer_ptr
+            .qtds()
+            .as_slice()
+            .index(3)
+            .write(QueueElementTransferDescriptor {
+                next_qtd_ptr: NextQtdPointer::new_valid(qtds_addr + qtd_size * 4),
+                alternate_next_qtd_ptr: AlternateQtdLinkPtr::INVALID,
+                qtd_token: TransferToken::new_active(
+                    PidCode::InToken,
+                    u15::new(PAYLOAD_BUFFER_LEN.try_into().unwrap()),
+                )
+                .with_data_toggle(true)
+                .with_interrupt_on_complete(true),
+                buffer_pointer_page_0: QtdBufferPagePointerPage0::new_with_raw_value(0)
+                    .with_ptr_upper(u20::new(buffer.phys_addr >> 12))
+                    .with_current_offset(u12::new(
+                        offset_of!(InitDeviceBuffer, descriptor_buffer)
+                            .try_into()
+                            .unwrap(),
+                    )),
+                buffer_pointer_page_1: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
+                buffer_pointer_page_2: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
+                buffer_pointer_page_3: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
+                buffer_pointer_page_4: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
+                extended_buffer_ptr_page_0: 0,
+                extended_buffer_ptr_page_1: 0,
+                extended_buffer_ptr_page_2: 0,
+                extended_buffer_ptr_page_3: 0,
+                extended_buffer_ptr_page_4: 0,
+            });
+        buffer_ptr
+            .qtds()
+            .as_slice()
+            .index(4)
+            .write(QueueElementTransferDescriptor {
+                next_qtd_ptr: NextQtdPointer::INVALID,
+                alternate_next_qtd_ptr: AlternateQtdLinkPtr::INVALID,
+                qtd_token: TransferToken::new_active(PidCode::OutToken, u15::ZERO)
+                    .with_data_toggle(true)
+                    .with_interrupt_on_complete(true),
+                buffer_pointer_page_0: QtdBufferPagePointerPage0::new_with_raw_value(0),
+                buffer_pointer_page_1: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
+                buffer_pointer_page_2: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
+                buffer_pointer_page_3: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
+                buffer_pointer_page_4: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
+                extended_buffer_ptr_page_0: 0,
+                extended_buffer_ptr_page_1: 0,
+                extended_buffer_ptr_page_2: 0,
+                extended_buffer_ptr_page_3: 0,
+                extended_buffer_ptr_page_4: 0,
+            });
+        buffer_ptr.qhs().as_slice().index(1).write(QueueHead {
+            queue_head_horizontal_link_ptr: QueueHeadHorizontalLinkPtr::new(
+                SelectType::Qh,
+                qhs_phys_addr + qh_size * 0,
+            ),
+            endpoint_charactersistics: EndpointCharacteristics::new_with_raw_value(0)
+                .with_head_of_reclamation_list_flag(false)
+                .with_device_addr(addr_to_set)
+                .with_endpoint_number({
+                    // control endpoint
+                    u4::ZERO
+                })
+                .with_endpoint_speed(EndpointSpeed::High.into())
+                .with_max_packet_len(u11::new({
+                    // this is the initial max packet len used until we know the device's max packet len
+                    PAYLOAD_BUFFER_LEN.try_into().unwrap()
+                })),
+            endpoint_capabilities: EndpointCapabilities::new_with_raw_value(0),
+            current_qtd_pointer: CurrentQtdLinkPtr::new_with_raw_value(0),
+            next_qtd_pointer: NextQtdPointer::new_valid(qtds_addr + qtd_size * 2),
+            // next_qtd_pointer: NextQtdPointer::INVALID,
+            alternate_qtd_pointer: AlternateQtdLinkPtr::INVALID,
+            transfer_token: TransferToken::new_with_raw_value(0),
+            buffer_ptr_page_0: QhBufferPtrPage0::new_with_raw_value(0),
+            buffer_ptr_page_1: QhBufferPtrPage1::new_with_raw_value(0),
+            buffer_ptr_page_2: QhBufferPtrPage2::new_with_raw_value(0),
+            buffer_ptr_page_3: QhBufferPtrPage3P::new_with_raw_value(0),
+            buffer_ptr_page_4: QhBufferPtrPage3P::new_with_raw_value(0),
+            extended_buffer_ptr_page_0: 0,
+            extended_buffer_ptr_page_1: 0,
+            extended_buffer_ptr_page_2: 0,
+            extended_buffer_ptr_page_3: 0,
+            extended_buffer_ptr_page_4: 0,
+        });
+        buffer_ptr.get_descriptor_setup_packet().write(transmute!(
+            SetupPacket::new_get_descriptor(PAYLOAD_BUFFER_LEN.try_into().unwrap(),)
+        ));
+        // Add the new QH to the circular linked list
+        buffer_ptr
+            .qhs()
+            .as_slice()
+            .index(0)
+            .queue_head_horizontal_link_ptr()
+            .write(QueueHeadHorizontalLinkPtr::new(
+                SelectType::Qh,
+                qhs_phys_addr + qh_size * 1,
+            ));
+
         while buffer_ptr
             .qtds()
             .as_slice()
@@ -359,12 +550,59 @@ impl InitializedEhci {
             .qtd_token
             .active()
         {
-            spin_loop();
+            log::info!("awaiting usb int future");
+            future::poll_fn(|context| {
+                self.waker.register(context.waker());
+                if self.int_occurred.swap(false, Ordering::Relaxed) {
+                    return Poll::Ready(());
+                }
+                Poll::Pending
+            })
+            .await;
         }
         log::info!("QTD 2 complete");
+        let qtd_3_ptr = buffer_ptr.qtds().as_slice().index(3);
+        while qtd_3_ptr.read().qtd_token.active() {
+            log::info!("awaiting usb int future");
+            future::poll_fn(|context| {
+                self.waker.register(context.waker());
+                if self.int_occurred.swap(false, Ordering::Relaxed) {
+                    return Poll::Ready(());
+                }
+                Poll::Pending
+            })
+            .await;
+        }
+        let bytes_to_transfer = qtd_3_ptr.qtd_token().read().total_bytes_to_transfer();
+        let bytes_transferred =
+            u15::new(PAYLOAD_BUFFER_LEN.try_into().unwrap()) - bytes_to_transfer;
+        let buffer = buffer_ptr.descriptor_buffer().read();
+        let bytes = &buffer[..usize::try_from(bytes_transferred.value()).unwrap()];
+        log::info!("QTD 3 complete. read: {bytes:02X?}");
+        while buffer_ptr
+            .qtds()
+            .as_slice()
+            .index(4)
+            .read()
+            .qtd_token
+            .active()
+        {
+            log::info!("awaiting usb int future");
+            future::poll_fn(|context| {
+                self.waker.register(context.waker());
+                if self.int_occurred.swap(false, Ordering::Relaxed) {
+                    return Poll::Ready(());
+                }
+                Poll::Pending
+            })
+            .await;
+        }
+        log::info!("QTD 4 complete");
         todo!()
     }
 }
+
+pub struct InitDeviceResetting {}
 
 #[bitfield(u32, debug)]
 struct ExtendedCapabilityPointerReg {
@@ -400,14 +638,6 @@ struct CapabilityInfo {
 #[repr(u8)]
 enum ExtendedCapability {
     UsbLegSup = 0x1,
-}
-
-#[bitfield(u32, debug)]
-struct UsbLegSupReg {
-    #[bit(16, r)]
-    bios_owned_semaphore: bool,
-    #[bit(24, rw)]
-    os_owned_semaphor: bool,
 }
 
 impl<P: PciAccess> Iterator for ExtendedCapabilitiesIterator<P> {

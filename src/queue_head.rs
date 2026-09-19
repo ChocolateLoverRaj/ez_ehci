@@ -1,5 +1,6 @@
 use arbitrary_int::{u2, u4, u7, u11, u12, u20, u27};
 use bitbybit::bitfield;
+use volatile::VolatileFieldAccess;
 
 use crate::{qtd::NextQtdPointer, transfer_token::TransferToken};
 
@@ -129,7 +130,7 @@ pub struct QhBufferPtrPage3P {
 }
 
 #[repr(C, align(32))]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, VolatileFieldAccess)]
 pub struct QueueHead {
     pub(crate) queue_head_horizontal_link_ptr: QueueHeadHorizontalLinkPtr,
     pub(crate) endpoint_charactersistics: EndpointCharacteristics,

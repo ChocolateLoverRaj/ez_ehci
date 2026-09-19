@@ -7,6 +7,9 @@ edition = "2024"
 arbitrary-int = "2.2.0"
 bitbybit = "2.0.1"
 debug-ignore = "1.0.5"
+embedded-hal-async = "1.0.0"
+futures = { version = "0.3.34", default-features = false }
 log = "0.4.34"
 num_enum = { version = "0.7.6", default-features = false }
 volatile = { version = "0.6.1", features = ["derive", "unstable"] }
+zerocopy = { version = "0.8.57", default-features = false, features = ["derive"] }

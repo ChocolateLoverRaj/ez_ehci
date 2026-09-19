@@ -1,12 +1,13 @@
-use core::{hint, ptr::NonNull};
+use core::{hint, ptr::NonNull, sync::atomic::AtomicBool};
 
 use arbitrary_int::{traits::Integer, u2};
+use futures::task::AtomicWaker;
 use volatile::{VolatilePtr, access::ReadOnly};
 
 use crate::{
     InitializedEhci, MappedMem, PeriodicFrameList,
     capability_regs::CapabilityRegs,
-    operational_regs::{OperationalRegs, OperationalRegsVolatileFieldAccess, PortScReg},
+    operational_regs::{OperationalRegs, OperationalRegsVolatileFieldAccess, PortScReg, UsbStsReg},
     periodic_list::PeriodicFrameListElement,
 };
 
@@ -87,6 +88,12 @@ impl OsOwnedEhci {
                 .with_port_change_interrupt_enable(true)
                 .with_host_system_error_interrupt_enable(true)
         });
+        // Clear pending interrupts
+        self.operational_regs.usb_sts().write(
+            UsbStsReg::new_with_raw_value(0)
+                .with_usb_int(true)
+                .with_frame_list_rollover(true),
+        );
         log::info!("Initialized USBINTR");
 
         // Initialize the periodic frame list
@@ -117,6 +124,9 @@ impl OsOwnedEhci {
             capability_regs: self.capability_regs,
             operational_regs: self.operational_regs,
             port_sc_regs: self.port_sc_regs,
+            int_occurred: AtomicBool::new(false),
+            waker: AtomicWaker::new(),
+            async_advance_occurred: AtomicBool::new(false),
         }
     }
 }

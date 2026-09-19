@@ -92,6 +92,28 @@ impl<P: PciAccess> TakingOwnershipEhci<P> {
         if reg.bios_owned_semaphore() {
             TryTakeOutput::NotYet(self)
         } else {
+            // let sts = UsbLegCtlStsReg::new_with_raw_value(
+            //     self.pci_access.read_u32(self.usb_leg_sup_offset.get() + 4),
+            // );
+            // log::warn!("USB legacy control/status: {sts:#X?}");
+            // self.pci_access.write_u32(
+            //     self.usb_leg_sup_offset.get() + 4,
+            //     UsbLegCtlStsReg::new_with_raw_value(0)
+            //         .with_usb_smi_enable(false)
+            //         .with_smi_on_usb_error_enable(false)
+            //         .with_smi_on_port_change_enable(false)
+            //         .with_smi_on_frame_list_rollover_enable(false)
+            //         .with_smi_on_host_system_error_enable(false)
+            //         .with_smi_on_os_ownership_enable(false)
+            //         .with_smi_on_pci_command_enable(false)
+            //         .with_smi_on_bar_enable(false)
+            //         .with_smi_on_os_ownership(true)
+            //         .with_smi_on_pci_command(true)
+            //         .with_smi_on_bar(true)
+            //         .raw_value(),
+            // );
+            // log::warn!("USB legacy control/status: {sts:#X?}");
+            // todo!();
             TryTakeOutput::Taken(unsafe { OsOwnedEhci::new(self.mapped_bar) })
         }
     }
