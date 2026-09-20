@@ -2,7 +2,10 @@ use arbitrary_int::{u2, u4, u7, u11, u12, u20, u27};
 use bitbybit::bitfield;
 use volatile::VolatileFieldAccess;
 
-use crate::{qtd::NextQtdPointer, transfer_token::TransferToken};
+use crate::{
+    qtd::{NextQtdPointer, QueueElementTransferDescriptor},
+    transfer_token::TransferToken,
+};
 
 #[bitfield(u32, debug)]
 pub struct QueueHeadHorizontalLinkPtr {
@@ -133,7 +136,7 @@ pub struct QhBufferPtrPage3P {
 #[derive(Debug, Clone, Copy, VolatileFieldAccess)]
 pub struct QueueHead {
     pub(crate) queue_head_horizontal_link_ptr: QueueHeadHorizontalLinkPtr,
-    pub(crate) endpoint_charactersistics: EndpointCharacteristics,
+    pub(crate) endpoint_characteristics: EndpointCharacteristics,
     pub(crate) endpoint_capabilities: EndpointCapabilities,
     pub(crate) current_qtd_pointer: CurrentQtdLinkPtr,
     pub(crate) next_qtd_pointer: NextQtdPointer,
@@ -150,4 +153,46 @@ pub struct QueueHead {
     pub(crate) extended_buffer_ptr_page_2: u32,
     pub(crate) extended_buffer_ptr_page_3: u32,
     pub(crate) extended_buffer_ptr_page_4: u32,
+}
+
+impl QueueHead {
+    pub(crate) fn new(
+        endpoint_characteristics: EndpointCharacteristics,
+        endpoint_capabilities: EndpointCapabilities,
+    ) -> Self {
+        Self {
+            queue_head_horizontal_link_ptr: QueueHeadHorizontalLinkPtr::INVALID,
+            endpoint_characteristics,
+            endpoint_capabilities,
+            current_qtd_pointer: CurrentQtdLinkPtr::ZERO,
+            next_qtd_pointer: NextQtdPointer::ZERO,
+            alternate_qtd_pointer: AlternateQtdLinkPtr::ZERO,
+            transfer_token: TransferToken::ZERO,
+            buffer_ptr_page_0: QhBufferPtrPage0::ZERO,
+            buffer_ptr_page_1: QhBufferPtrPage1::ZERO,
+            buffer_ptr_page_2: QhBufferPtrPage2::ZERO,
+            buffer_ptr_page_3: QhBufferPtrPage3P::ZERO,
+            buffer_ptr_page_4: QhBufferPtrPage3P::ZERO,
+            extended_buffer_ptr_page_0: 0,
+            extended_buffer_ptr_page_1: 0,
+            extended_buffer_ptr_page_2: 0,
+            extended_buffer_ptr_page_3: 0,
+            extended_buffer_ptr_page_4: 0,
+        }
+    }
+
+    pub fn link_contiguous_qtds(
+        &mut self,
+        qtds: &mut [QueueElementTransferDescriptor],
+        phys_addr: u32,
+    ) {
+        self.next_qtd_pointer = NextQtdPointer::new_valid(phys_addr);
+        for i in 0..qtds.len() - 1 {
+            qtds[i].next_qtd_ptr = NextQtdPointer::new_valid(
+                phys_addr
+                    + u32::try_from(i + 1).unwrap()
+                        * u32::try_from(size_of::<QueueElementTransferDescriptor>()).unwrap(),
+            )
+        }
+    }
 }

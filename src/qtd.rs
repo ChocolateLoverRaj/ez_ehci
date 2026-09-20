@@ -2,7 +2,9 @@ use arbitrary_int::{u12, u20, u27};
 use bitbybit::bitfield;
 use volatile::VolatileFieldAccess;
 
-use crate::{queue_head::AlternateQtdLinkPtr, transfer_token::TransferToken};
+use crate::{
+    buffer_ptrs::BufferPtrs, queue_head::AlternateQtdLinkPtr, transfer_token::TransferToken,
+};
 
 #[bitfield(u32, debug)]
 pub struct NextQtdPointer {
@@ -55,4 +57,30 @@ pub struct QueueElementTransferDescriptor {
     pub(crate) extended_buffer_ptr_page_2: u32,
     pub(crate) extended_buffer_ptr_page_3: u32,
     pub(crate) extended_buffer_ptr_page_4: u32,
+}
+
+impl QueueElementTransferDescriptor {
+    pub fn new(qtd_token: TransferToken, buffer_ptrs: BufferPtrs) -> Self {
+        Self {
+            next_qtd_ptr: NextQtdPointer::INVALID,
+            alternate_next_qtd_ptr: AlternateQtdLinkPtr::INVALID,
+            qtd_token,
+            buffer_pointer_page_0: QtdBufferPagePointerPage0::new_with_raw_value(0)
+                .with_current_offset(buffer_ptrs.offset())
+                .with_ptr_upper(buffer_ptrs.ptr_bits_12_31(0)),
+            buffer_pointer_page_1: QtdBufferPagePointerPage1Plus::new_with_raw_value(0)
+                .with_ptr_upper(buffer_ptrs.ptr_bits_12_31(1)),
+            buffer_pointer_page_2: QtdBufferPagePointerPage1Plus::new_with_raw_value(0)
+                .with_ptr_upper(buffer_ptrs.ptr_bits_12_31(2)),
+            buffer_pointer_page_3: QtdBufferPagePointerPage1Plus::new_with_raw_value(0)
+                .with_ptr_upper(buffer_ptrs.ptr_bits_12_31(3)),
+            buffer_pointer_page_4: QtdBufferPagePointerPage1Plus::new_with_raw_value(0)
+                .with_ptr_upper(buffer_ptrs.ptr_bits_12_31(4)),
+            extended_buffer_ptr_page_0: buffer_ptrs.ptr_bits_32_63(0),
+            extended_buffer_ptr_page_1: buffer_ptrs.ptr_bits_32_63(1),
+            extended_buffer_ptr_page_2: buffer_ptrs.ptr_bits_32_63(2),
+            extended_buffer_ptr_page_3: buffer_ptrs.ptr_bits_32_63(3),
+            extended_buffer_ptr_page_4: buffer_ptrs.ptr_bits_32_63(4),
+        }
+    }
 }

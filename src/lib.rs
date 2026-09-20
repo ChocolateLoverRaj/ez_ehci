@@ -1,4 +1,5 @@
 #![no_std]
+mod buffer_ptrs;
 mod capability_regs;
 mod endpoint_speed;
 mod new_ehci;
@@ -12,8 +13,7 @@ mod setup_packet;
 mod transfer_token;
 mod usb_leg_sup;
 
-use core::future;
-use core::pin::pin;
+use core::future::{self};
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::Poll;
 use core::{fmt::Debug, mem::offset_of, num::NonZero, ptr::NonNull};
@@ -21,11 +21,11 @@ use core::{fmt::Debug, mem::offset_of, num::NonZero, ptr::NonNull};
 use arbitrary_int::{traits::Integer, u4, u7, u11, u12, u15, u20};
 use bitbybit::bitfield;
 use embedded_hal_async::delay::DelayNs;
-use futures::future::{Either, select};
 use futures::task::AtomicWaker;
 use volatile::{VolatileFieldAccess, VolatilePtr, access::ReadOnly};
 use zerocopy::transmute;
 
+use crate::buffer_ptrs::BufferPtrs;
 pub use crate::new_ehci::{AnyEhci, new_ehci};
 use crate::operational_regs::UsbStsReg;
 pub use crate::os_owned_ehci::OsOwnedEhci;
@@ -83,14 +83,6 @@ pub struct NewDeviceEvent {
     pub port: RootPortNumber,
 }
 
-#[derive(Debug)]
-pub enum RunOutput {
-    /// Nothing to do, wait for interrupts
-    Idle,
-    /// Device detected
-    NewDevice(NewDeviceEvent),
-}
-
 pub struct InitializedEhci {
     capability_regs: VolatilePtr<'static, CapabilityRegs, ReadOnly>,
     operational_regs: VolatilePtr<'static, OperationalRegs>,
@@ -128,21 +120,29 @@ pub enum InitDeviceError {
 }
 
 impl InitializedEhci {
-    pub fn run(&self) -> RunOutput {
-        // Check for devices
-        for port in 0..self.capability_regs.hcs_params().read().n_ports().value() {
-            log::info!("checking port {port}");
-            let port_sc_reg = self
-                .port_sc_regs
-                .index(usize::try_from(port).unwrap())
-                .read();
-            if port_sc_reg.current_connect_status() {
-                return RunOutput::NewDevice(NewDeviceEvent {
-                    port: u4::new(port).try_into().unwrap(),
-                });
+    pub async fn run(&self) -> NewDeviceEvent {
+        loop {
+            // Check for devices
+            for port in 0..self.capability_regs.hcs_params().read().n_ports().value() {
+                let port_sc_reg = self
+                    .port_sc_regs
+                    .index(usize::try_from(port).unwrap())
+                    .read();
+                if port_sc_reg.current_connect_status() {
+                    return NewDeviceEvent {
+                        port: u4::new(port).try_into().unwrap(),
+                    };
+                }
             }
+            future::poll_fn(|context| {
+                self.waker.register(context.waker());
+                if self.int_occurred.swap(false, Ordering::Relaxed) {
+                    return Poll::Ready(());
+                }
+                Poll::Pending
+            })
+            .await;
         }
-        RunOutput::Idle
     }
 
     pub fn handle_interrupt(&self) {
@@ -257,59 +257,26 @@ impl InitializedEhci {
             buffer.phys_addr + u32::try_from(offset_of!(InitDeviceBuffer, qtds)).unwrap();
         let qtd_size = u32::try_from(size_of::<QueueElementTransferDescriptor>()).unwrap();
         // First transfer: set address
-        buffer_ptr
-            .qtds()
-            .as_slice()
-            .index(0)
-            .write(QueueElementTransferDescriptor {
-                next_qtd_ptr: NextQtdPointer::new_valid(qtds_addr + qtd_size * 1),
-                alternate_next_qtd_ptr: AlternateQtdLinkPtr::INVALID,
-                qtd_token: TransferToken::new_active(PidCode::SetupToken, u15::new(8))
+        let mut qtds = [
+            QueueElementTransferDescriptor::new(
+                TransferToken::new_active(PidCode::SetupToken, u15::new(8))
                     .with_interrupt_on_complete(true),
-                buffer_pointer_page_0: QtdBufferPagePointerPage0::new_with_raw_value(0)
-                    .with_ptr_upper(u20::new(buffer.phys_addr >> 12))
-                    .with_current_offset(u12::new(
-                        offset_of!(InitDeviceBuffer, set_address_setup_packet)
-                            .try_into()
+                BufferPtrs::new_contiguous(
+                    u64::from(buffer.phys_addr)
+                        + u64::try_from(offset_of!(InitDeviceBuffer, set_address_setup_packet))
                             .unwrap(),
-                    )),
-                buffer_pointer_page_1: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
-                buffer_pointer_page_2: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
-                buffer_pointer_page_3: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
-                buffer_pointer_page_4: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
-                extended_buffer_ptr_page_0: 0,
-                extended_buffer_ptr_page_1: 0,
-                extended_buffer_ptr_page_2: 0,
-                extended_buffer_ptr_page_3: 0,
-                extended_buffer_ptr_page_4: 0,
-            });
-        buffer_ptr
-            .qtds()
-            .as_slice()
-            .index(1)
-            .write(QueueElementTransferDescriptor {
-                next_qtd_ptr: NextQtdPointer::INVALID,
-                alternate_next_qtd_ptr: AlternateQtdLinkPtr::INVALID,
-                qtd_token: TransferToken::new_active(PidCode::InToken, u15::ZERO)
+                    8,
+                ),
+            ),
+            QueueElementTransferDescriptor::new(
+                TransferToken::new_active(PidCode::InToken, u15::ZERO)
                     .with_interrupt_on_complete(true)
                     .with_data_toggle(true),
-                buffer_pointer_page_0: QtdBufferPagePointerPage0::new_with_raw_value(0),
-                buffer_pointer_page_1: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
-                buffer_pointer_page_2: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
-                buffer_pointer_page_3: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
-                buffer_pointer_page_4: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
-                extended_buffer_ptr_page_0: 0,
-                extended_buffer_ptr_page_1: 0,
-                extended_buffer_ptr_page_2: 0,
-                extended_buffer_ptr_page_3: 0,
-                extended_buffer_ptr_page_4: 0,
-            });
-        buffer_ptr.qhs().as_slice().index(0).write(QueueHead {
-            queue_head_horizontal_link_ptr: QueueHeadHorizontalLinkPtr::new(
-                SelectType::Qh,
-                qhs_phys_addr,
+                BufferPtrs::EMPTY,
             ),
-            endpoint_charactersistics: EndpointCharacteristics::new_with_raw_value(0)
+        ];
+        let mut qh = QueueHead::new(
+            EndpointCharacteristics::new_with_raw_value(0)
                 .with_head_of_reclamation_list_flag({
                     // This is the first item in the circular linked list of queue heads
                     true
@@ -327,23 +294,17 @@ impl InitializedEhci {
                     // this is the initial max packet len used until we know the device's max packet len
                     PAYLOAD_BUFFER_LEN.try_into().unwrap()
                 })),
-            endpoint_capabilities: EndpointCapabilities::new_with_raw_value(0),
-            current_qtd_pointer: CurrentQtdLinkPtr::new_with_raw_value(0),
-            next_qtd_pointer: NextQtdPointer::new_valid(qtds_addr + qtd_size * 0),
-            // next_qtd_pointer: NextQtdPointer::INVALID,
-            alternate_qtd_pointer: AlternateQtdLinkPtr::INVALID,
-            transfer_token: TransferToken::new_with_raw_value(0),
-            buffer_ptr_page_0: QhBufferPtrPage0::new_with_raw_value(0),
-            buffer_ptr_page_1: QhBufferPtrPage1::new_with_raw_value(0),
-            buffer_ptr_page_2: QhBufferPtrPage2::new_with_raw_value(0),
-            buffer_ptr_page_3: QhBufferPtrPage3P::new_with_raw_value(0),
-            buffer_ptr_page_4: QhBufferPtrPage3P::new_with_raw_value(0),
-            extended_buffer_ptr_page_0: 0,
-            extended_buffer_ptr_page_1: 0,
-            extended_buffer_ptr_page_2: 0,
-            extended_buffer_ptr_page_3: 0,
-            extended_buffer_ptr_page_4: 0,
-        });
+            EndpointCapabilities::new_with_raw_value(0),
+        );
+        qh.queue_head_horizontal_link_ptr =
+            QueueHeadHorizontalLinkPtr::new(SelectType::Qh, qhs_phys_addr);
+        qh.link_contiguous_qtds(&mut qtds, qtds_addr);
+        buffer_ptr
+            .qtds()
+            .as_slice()
+            .index(0..2)
+            .copy_from_slice(&qtds);
+        buffer_ptr.qhs().as_slice().index(0).write(qh);
         buffer_ptr
             .set_address_setup_packet()
             .write(transmute!(SetupPacket::new_set_address(addr_to_set)));
@@ -416,90 +377,39 @@ impl InitializedEhci {
         // .await;
 
         log::info!("Doing get descriptor");
-        // Next transfer: get descriptor
-        buffer_ptr
-            .qtds()
-            .as_slice()
-            .index(2)
-            .write(QueueElementTransferDescriptor {
-                next_qtd_ptr: NextQtdPointer::new_valid(qtds_addr + qtd_size * 3),
-                alternate_next_qtd_ptr: AlternateQtdLinkPtr::INVALID,
-                qtd_token: TransferToken::new_active(PidCode::SetupToken, u15::new(8))
+        let mut qtds = [
+            QueueElementTransferDescriptor::new(
+                TransferToken::new_active(PidCode::SetupToken, u15::new(8))
                     .with_interrupt_on_complete(true),
-                buffer_pointer_page_0: QtdBufferPagePointerPage0::new_with_raw_value(0)
-                    .with_ptr_upper(u20::new(buffer.phys_addr >> 12))
-                    .with_current_offset(u12::new(
-                        offset_of!(InitDeviceBuffer, get_descriptor_setup_packet)
-                            .try_into()
+                BufferPtrs::new_contiguous(
+                    u64::from(buffer.phys_addr)
+                        + u64::try_from(offset_of!(InitDeviceBuffer, get_descriptor_setup_packet))
                             .unwrap(),
-                    )),
-                buffer_pointer_page_1: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
-                buffer_pointer_page_2: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
-                buffer_pointer_page_3: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
-                buffer_pointer_page_4: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
-                extended_buffer_ptr_page_0: 0,
-                extended_buffer_ptr_page_1: 0,
-                extended_buffer_ptr_page_2: 0,
-                extended_buffer_ptr_page_3: 0,
-                extended_buffer_ptr_page_4: 0,
-            });
-        buffer_ptr
-            .qtds()
-            .as_slice()
-            .index(3)
-            .write(QueueElementTransferDescriptor {
-                next_qtd_ptr: NextQtdPointer::new_valid(qtds_addr + qtd_size * 4),
-                alternate_next_qtd_ptr: AlternateQtdLinkPtr::INVALID,
-                qtd_token: TransferToken::new_active(
+                    8,
+                ),
+            ),
+            QueueElementTransferDescriptor::new(
+                TransferToken::new_active(
                     PidCode::InToken,
                     u15::new(PAYLOAD_BUFFER_LEN.try_into().unwrap()),
                 )
                 .with_data_toggle(true)
                 .with_interrupt_on_complete(true),
-                buffer_pointer_page_0: QtdBufferPagePointerPage0::new_with_raw_value(0)
-                    .with_ptr_upper(u20::new(buffer.phys_addr >> 12))
-                    .with_current_offset(u12::new(
-                        offset_of!(InitDeviceBuffer, descriptor_buffer)
-                            .try_into()
-                            .unwrap(),
-                    )),
-                buffer_pointer_page_1: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
-                buffer_pointer_page_2: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
-                buffer_pointer_page_3: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
-                buffer_pointer_page_4: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
-                extended_buffer_ptr_page_0: 0,
-                extended_buffer_ptr_page_1: 0,
-                extended_buffer_ptr_page_2: 0,
-                extended_buffer_ptr_page_3: 0,
-                extended_buffer_ptr_page_4: 0,
-            });
-        buffer_ptr
-            .qtds()
-            .as_slice()
-            .index(4)
-            .write(QueueElementTransferDescriptor {
-                next_qtd_ptr: NextQtdPointer::INVALID,
-                alternate_next_qtd_ptr: AlternateQtdLinkPtr::INVALID,
-                qtd_token: TransferToken::new_active(PidCode::OutToken, u15::ZERO)
+                BufferPtrs::new_contiguous(
+                    u64::from(buffer.phys_addr)
+                        + u64::try_from(offset_of!(InitDeviceBuffer, descriptor_buffer)).unwrap(),
+                    PAYLOAD_BUFFER_LEN.try_into().unwrap(),
+                ),
+            ),
+            QueueElementTransferDescriptor::new(
+                TransferToken::new_active(PidCode::OutToken, u15::ZERO)
                     .with_data_toggle(true)
                     .with_interrupt_on_complete(true),
-                buffer_pointer_page_0: QtdBufferPagePointerPage0::new_with_raw_value(0),
-                buffer_pointer_page_1: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
-                buffer_pointer_page_2: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
-                buffer_pointer_page_3: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
-                buffer_pointer_page_4: QtdBufferPagePointerPage1Plus::new_with_raw_value(0),
-                extended_buffer_ptr_page_0: 0,
-                extended_buffer_ptr_page_1: 0,
-                extended_buffer_ptr_page_2: 0,
-                extended_buffer_ptr_page_3: 0,
-                extended_buffer_ptr_page_4: 0,
-            });
-        buffer_ptr.qhs().as_slice().index(1).write(QueueHead {
-            queue_head_horizontal_link_ptr: QueueHeadHorizontalLinkPtr::new(
-                SelectType::Qh,
-                qhs_phys_addr + qh_size * 0,
+                BufferPtrs::EMPTY,
             ),
-            endpoint_charactersistics: EndpointCharacteristics::new_with_raw_value(0)
+        ];
+        let mut qh = QueueHead::new(
+            EndpointCharacteristics::new_with_raw_value(0)
                 .with_head_of_reclamation_list_flag(false)
                 .with_device_addr(addr_to_set)
                 .with_endpoint_number({
@@ -511,23 +421,17 @@ impl InitializedEhci {
                     // this is the initial max packet len used until we know the device's max packet len
                     PAYLOAD_BUFFER_LEN.try_into().unwrap()
                 })),
-            endpoint_capabilities: EndpointCapabilities::new_with_raw_value(0),
-            current_qtd_pointer: CurrentQtdLinkPtr::new_with_raw_value(0),
-            next_qtd_pointer: NextQtdPointer::new_valid(qtds_addr + qtd_size * 2),
-            // next_qtd_pointer: NextQtdPointer::INVALID,
-            alternate_qtd_pointer: AlternateQtdLinkPtr::INVALID,
-            transfer_token: TransferToken::new_with_raw_value(0),
-            buffer_ptr_page_0: QhBufferPtrPage0::new_with_raw_value(0),
-            buffer_ptr_page_1: QhBufferPtrPage1::new_with_raw_value(0),
-            buffer_ptr_page_2: QhBufferPtrPage2::new_with_raw_value(0),
-            buffer_ptr_page_3: QhBufferPtrPage3P::new_with_raw_value(0),
-            buffer_ptr_page_4: QhBufferPtrPage3P::new_with_raw_value(0),
-            extended_buffer_ptr_page_0: 0,
-            extended_buffer_ptr_page_1: 0,
-            extended_buffer_ptr_page_2: 0,
-            extended_buffer_ptr_page_3: 0,
-            extended_buffer_ptr_page_4: 0,
-        });
+            EndpointCapabilities::ZERO,
+        );
+        qh.queue_head_horizontal_link_ptr =
+            QueueHeadHorizontalLinkPtr::new(SelectType::Qh, qhs_phys_addr + qh_size * 0);
+        qh.link_contiguous_qtds(&mut qtds, qtds_addr + qtd_size * 2);
+        buffer_ptr
+            .qtds()
+            .as_slice()
+            .index(2..5)
+            .copy_from_slice(&qtds);
+        buffer_ptr.qhs().as_slice().index(1).write(qh);
         buffer_ptr.get_descriptor_setup_packet().write(transmute!(
             SetupPacket::new_get_descriptor(PAYLOAD_BUFFER_LEN.try_into().unwrap(),)
         ));
