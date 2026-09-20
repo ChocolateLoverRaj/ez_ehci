@@ -7,8 +7,14 @@ use volatile::{VolatilePtr, access::ReadOnly};
 use crate::{
     InitializedEhci, MappedMem, PeriodicFrameList,
     capability_regs::CapabilityRegs,
-    operational_regs::{OperationalRegs, OperationalRegsVolatileFieldAccess, PortScReg, UsbStsReg},
+    operational_regs::{
+        AsyncListAddrReg, OperationalRegs, OperationalRegsVolatileFieldAccess, PortScReg, UsbStsReg,
+    },
     periodic_list::PeriodicFrameListElement,
+    queue_head::{
+        EndpointCapabilities, EndpointCharacteristics, QueueHead, QueueHeadHorizontalLinkPtr,
+        SelectType,
+    },
 };
 
 pub struct OsOwnedEhci {
@@ -52,7 +58,11 @@ impl OsOwnedEhci {
         }
     }
 
-    pub fn init(self, periodic_frame_list_mem: MappedMem<PeriodicFrameList>) -> InitializedEhci {
+    pub fn init(
+        self,
+        periodic_frame_list_mem: MappedMem<PeriodicFrameList>,
+        anchor_qh_mem: MappedMem<QueueHead>,
+    ) -> InitializedEhci {
         // Halt
         log::info!("Halting eHCI");
         self.operational_regs
@@ -120,6 +130,22 @@ impl OsOwnedEhci {
             .update(|config_flag| config_flag.with_configure_flag(true));
         log::info!("Initialized CONFIGFLAG");
 
+        // Initialize the async schedule
+        let qh_ptr = unsafe { VolatilePtr::new(anchor_qh_mem.ptr) };
+        let mut qh = QueueHead::new(
+            EndpointCharacteristics::ZERO.with_head_of_reclamation_list_flag(true),
+            EndpointCapabilities::ZERO,
+        );
+        qh.queue_head_horizontal_link_ptr =
+            QueueHeadHorizontalLinkPtr::new(SelectType::Qh, anchor_qh_mem.phys_addr);
+        qh_ptr.write(qh);
+        self.operational_regs
+            .async_list_addr()
+            .write(AsyncListAddrReg::new(anchor_qh_mem.phys_addr));
+        self.operational_regs
+            .usb_cmd()
+            .update(|usb_cmd| usb_cmd.with_async_schedule_enable(true));
+
         InitializedEhci {
             capability_regs: self.capability_regs,
             operational_regs: self.operational_regs,
@@ -127,6 +153,7 @@ impl OsOwnedEhci {
             int_occurred: AtomicBool::new(false),
             waker: AtomicWaker::new(),
             async_advance_occurred: AtomicBool::new(false),
+            anchor_qh: anchor_qh_mem,
         }
     }
 }

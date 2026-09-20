@@ -1,5 +1,5 @@
 use core::future::{self};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use core::task::Poll;
 use core::{fmt::Debug, mem::offset_of};
 
@@ -48,6 +48,7 @@ pub struct InitializedEhci {
     pub(crate) int_occurred: AtomicBool,
     pub(crate) waker: AtomicWaker,
     pub(crate) async_advance_occurred: AtomicBool,
+    pub(crate) anchor_qh: MappedMem<QueueHead>,
 }
 
 /// Safety: safe to drop in different thread than it was created in.
@@ -78,6 +79,20 @@ pub enum InitDeviceError {
 }
 
 impl InitializedEhci {
+    fn add_qh_to_async_list(&self, qh: MappedMem<QueueHead>) {
+        let qh_ptr = unsafe { VolatilePtr::new(qh.ptr) };
+        let anchor_qh_ptr = unsafe { VolatilePtr::new(self.anchor_qh.ptr) };
+        qh_ptr
+            .queue_head_horizontal_link_ptr()
+            .write(anchor_qh_ptr.queue_head_horizontal_link_ptr().read());
+        anchor_qh_ptr
+            .queue_head_horizontal_link_ptr()
+            .write(QueueHeadHorizontalLinkPtr::new(
+                SelectType::Qh,
+                qh.phys_addr,
+            ));
+    }
+
     pub async fn run(&self) -> NewDeviceEvent {
         loop {
             // Check for devices
@@ -254,8 +269,6 @@ impl InitializedEhci {
                 })),
             EndpointCapabilities::new_with_raw_value(0),
         );
-        qh.queue_head_horizontal_link_ptr =
-            QueueHeadHorizontalLinkPtr::new(SelectType::Qh, qhs_phys_addr);
         qh.link_contiguous_qtds(&mut qtds, qtds_addr);
         buffer_ptr
             .qtds()
@@ -266,19 +279,10 @@ impl InitializedEhci {
         buffer_ptr
             .set_address_setup_packet()
             .write(transmute!(SetupPacket::new_set_address(addr_to_set)));
-        let value = AsyncListAddrReg::new(qhs_phys_addr);
-        self.operational_regs.async_list_addr().write(value);
-        // let usb_sts = self.operational_regs.usb_sts().read();
-        // log::info!("USB status: {usb_sts:#X?}");
-        self.operational_regs
-            .usb_cmd()
-            .update(|usb_cmd| usb_cmd.with_async_schedule_enable(true));
-        log::info!("Initialized and enabled async schedule.");
-        let usb_sts = self.operational_regs.usb_sts().read();
-        if usb_sts.host_system_error() {
-            log::error!("USB status: {usb_sts:#X?}");
-            return Err(InitDeviceError::HostSystemError);
-        }
+        self.add_qh_to_async_list(MappedMem {
+            phys_addr: qhs_phys_addr,
+            ptr: buffer_ptr.qhs().as_slice().index(0).as_raw_ptr(),
+        });
 
         while buffer_ptr
             .qtds()
@@ -381,8 +385,6 @@ impl InitializedEhci {
                 })),
             EndpointCapabilities::ZERO,
         );
-        qh.queue_head_horizontal_link_ptr =
-            QueueHeadHorizontalLinkPtr::new(SelectType::Qh, qhs_phys_addr + qh_size * 0);
         qh.link_contiguous_qtds(&mut qtds, qtds_addr + qtd_size * 2);
         buffer_ptr
             .qtds()
@@ -393,16 +395,10 @@ impl InitializedEhci {
         buffer_ptr.get_descriptor_setup_packet().write(transmute!(
             SetupPacket::new_get_descriptor(PAYLOAD_BUFFER_LEN.try_into().unwrap(),)
         ));
-        // Add the new QH to the circular linked list
-        buffer_ptr
-            .qhs()
-            .as_slice()
-            .index(0)
-            .queue_head_horizontal_link_ptr()
-            .write(QueueHeadHorizontalLinkPtr::new(
-                SelectType::Qh,
-                qhs_phys_addr + qh_size * 1,
-            ));
+        self.add_qh_to_async_list(MappedMem {
+            phys_addr: qhs_phys_addr + qh_size,
+            ptr: buffer_ptr.qhs().as_slice().index(1).as_raw_ptr(),
+        });
 
         while buffer_ptr
             .qtds()
