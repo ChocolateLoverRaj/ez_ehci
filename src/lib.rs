@@ -1,4 +1,6 @@
 #![no_std]
+extern crate alloc;
+
 mod buffer_ptrs;
 mod capability_regs;
 mod endpoint_speed;
@@ -15,47 +17,19 @@ mod setup_packet;
 mod transfer_token;
 mod usb_leg_sup;
 
-use core::future::{self};
-use core::sync::atomic::{AtomicBool, Ordering};
-use core::task::Poll;
 use core::{fmt::Debug, mem::offset_of, num::NonZero, ptr::NonNull};
 
-use arbitrary_int::{traits::Integer, u4, u7, u11, u12, u15, u20};
 use bitbybit::bitfield;
-use embedded_hal_async::delay::DelayNs;
-use futures::task::AtomicWaker;
 use volatile::{VolatileFieldAccess, VolatilePtr, access::ReadOnly};
-use zerocopy::transmute;
 
-use crate::buffer_ptrs::BufferPtrs;
+use crate::capability_regs::{CapabilityRegs, CapabilityRegsVolatileFieldAccess};
 pub use crate::initialized_ehci::{InitDeviceBuffer, InitializedEhci, NewDeviceEvent};
 pub use crate::new_ehci::{AnyEhci, new_ehci};
-use crate::operational_regs::UsbStsReg;
 pub use crate::os_owned_ehci::OsOwnedEhci;
 pub use crate::pci::{PCI_CLASS, PCI_PROG_IF, PCI_SUBCLASS, PciAccess};
 pub use crate::periodic_list::PeriodicFrameList;
-use crate::qtd::QueueElementTransferDescriptorVolatileFieldAccess;
-use crate::queue_head::QueueHeadVolatileFieldAccess;
-use crate::setup_packet::SetupPacket;
+pub use crate::queue_head::QueueHead;
 pub use crate::usb_leg_sup::{BiosOwnedEhci, TakingOwnershipEhci, TryTakeOutput};
-use crate::{
-    capability_regs::{CapabilityRegs, CapabilityRegsVolatileFieldAccess},
-    endpoint_speed::EndpointSpeed,
-    operational_regs::{
-        AsyncListAddrReg, LineStatus, OperationalRegs, OperationalRegsVolatileFieldAccess,
-        PortScReg,
-    },
-    qtd::{
-        NextQtdPointer, QtdBufferPagePointerPage0, QtdBufferPagePointerPage1Plus,
-        QueueElementTransferDescriptor,
-    },
-    queue_head::{
-        AlternateQtdLinkPtr, CurrentQtdLinkPtr, EndpointCapabilities, EndpointCharacteristics,
-        QhBufferPtrPage0, QhBufferPtrPage1, QhBufferPtrPage2, QhBufferPtrPage3P, QueueHead,
-        QueueHeadHorizontalLinkPtr, SelectType,
-    },
-    transfer_token::{PidCode, TransferToken},
-};
 
 #[derive(Debug, Clone, Copy)]
 pub struct MappedMem<T> {

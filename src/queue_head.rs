@@ -3,7 +3,7 @@ use bitbybit::bitfield;
 use volatile::VolatileFieldAccess;
 
 use crate::{
-    qtd::{NextQtdPointer, QueueElementTransferDescriptor},
+    qtd::{NextQtdPointer, Qtd},
     transfer_token::TransferToken,
 };
 
@@ -183,7 +183,7 @@ impl QueueHead {
 
     pub fn link_contiguous_qtds(
         &mut self,
-        qtds: &mut [QueueElementTransferDescriptor],
+        qtds: &mut [Qtd],
         phys_addr: u32,
     ) {
         self.next_qtd_pointer = NextQtdPointer::new_valid(phys_addr);
@@ -191,7 +191,7 @@ impl QueueHead {
             qtds[i].next_qtd_ptr = NextQtdPointer::new_valid(
                 phys_addr
                     + u32::try_from(i + 1).unwrap()
-                        * u32::try_from(size_of::<QueueElementTransferDescriptor>()).unwrap(),
+                        * u32::try_from(size_of::<Qtd>()).unwrap(),
             )
         }
     }

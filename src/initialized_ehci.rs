@@ -17,7 +17,7 @@ use crate::operational_regs::UsbStsReg;
 pub use crate::os_owned_ehci::OsOwnedEhci;
 pub use crate::pci::{PCI_CLASS, PCI_PROG_IF, PCI_SUBCLASS, PciAccess};
 pub use crate::periodic_list::PeriodicFrameList;
-use crate::qtd::QueueElementTransferDescriptorVolatileFieldAccess;
+use crate::qtd::QtdVolatileFieldAccess;
 use crate::queue_head::QueueHeadVolatileFieldAccess;
 use crate::root_port_number::RootPortNumber;
 use crate::setup_packet::SetupPacket;
@@ -29,10 +29,7 @@ use crate::{
         AsyncListAddrReg, LineStatus, OperationalRegs, OperationalRegsVolatileFieldAccess,
         PortScReg,
     },
-    qtd::{
-        NextQtdPointer, QtdBufferPagePointerPage0, QtdBufferPagePointerPage1Plus,
-        QueueElementTransferDescriptor,
-    },
+    qtd::{NextQtdPointer, Qtd, QtdBufferPagePointerPage0, QtdBufferPagePointerPage1Plus},
     queue_head::{
         AlternateQtdLinkPtr, CurrentQtdLinkPtr, EndpointCapabilities, EndpointCharacteristics,
         QhBufferPtrPage0, QhBufferPtrPage1, QhBufferPtrPage2, QhBufferPtrPage3P, QueueHead,
@@ -40,6 +37,11 @@ use crate::{
     },
     transfer_token::{PidCode, TransferToken},
 };
+
+struct QtdWatcher {
+    waker: AtomicWaker,
+    qtd_phys_addr: MappedMem<Qtd>,
+}
 
 pub struct InitializedEhci {
     pub(crate) capability_regs: VolatilePtr<'static, CapabilityRegs, ReadOnly>,
@@ -49,6 +51,7 @@ pub struct InitializedEhci {
     pub(crate) waker: AtomicWaker,
     pub(crate) async_advance_occurred: AtomicBool,
     pub(crate) anchor_qh: MappedMem<QueueHead>,
+    pub(crate) qtds_to_watch: QtdWatcher,
 }
 
 /// Safety: safe to drop in different thread than it was created in.
@@ -61,7 +64,7 @@ const PAYLOAD_BUFFER_LEN: usize = 64;
 #[repr(C, align(0x1000))]
 #[derive(Debug, VolatileFieldAccess, Clone, Copy)]
 pub struct InitDeviceBuffer {
-    qtds: [QueueElementTransferDescriptor; 5],
+    qtds: [Qtd; 5],
     qhs: [QueueHead; 2],
     set_address_setup_packet: [u8; 8],
     get_descriptor_setup_packet: [u8; 8],
@@ -79,6 +82,9 @@ pub enum InitDeviceError {
 }
 
 impl InitializedEhci {
+pub crate fn new(capability_regs: VolatilePtr<CapabilityRegs, ReadOnly>, operational_regs: VolatilePtr<OperationalRegs>, port_sc_regs: VolatilePtr<[PortScReg]>) -> Self {
+    Self { capability_regs, operational_regs, port_sc_regs, int_occurred: (), waker: (), async_advance_occurred: (), anchor_qh: (), qtds_to_watch: () }
+}
     fn add_qh_to_async_list(&self, qh: MappedMem<QueueHead>) {
         let qh_ptr = unsafe { VolatilePtr::new(qh.ptr) };
         let anchor_qh_ptr = unsafe { VolatilePtr::new(self.anchor_qh.ptr) };
@@ -228,10 +234,10 @@ impl InitializedEhci {
         let qh_size = u32::try_from(size_of::<QueueHead>()).unwrap();
         let qtds_addr =
             buffer.phys_addr + u32::try_from(offset_of!(InitDeviceBuffer, qtds)).unwrap();
-        let qtd_size = u32::try_from(size_of::<QueueElementTransferDescriptor>()).unwrap();
+        let qtd_size = u32::try_from(size_of::<Qtd>()).unwrap();
         // First transfer: set address
         let mut qtds = [
-            QueueElementTransferDescriptor::new(
+            Qtd::new(
                 TransferToken::new_active(PidCode::SetupToken, u15::new(8))
                     .with_interrupt_on_complete(true),
                 BufferPtrs::new_contiguous(
@@ -241,7 +247,7 @@ impl InitializedEhci {
                     8,
                 ),
             ),
-            QueueElementTransferDescriptor::new(
+            Qtd::new(
                 TransferToken::new_active(PidCode::InToken, u15::ZERO)
                     .with_interrupt_on_complete(true)
                     .with_data_toggle(true),
@@ -250,10 +256,6 @@ impl InitializedEhci {
         ];
         let mut qh = QueueHead::new(
             EndpointCharacteristics::new_with_raw_value(0)
-                .with_head_of_reclamation_list_flag({
-                    // This is the first item in the circular linked list of queue heads
-                    true
-                })
                 .with_device_addr({
                     // new devices have address 0
                     u7::ZERO
@@ -340,7 +342,7 @@ impl InitializedEhci {
 
         log::info!("Doing get descriptor");
         let mut qtds = [
-            QueueElementTransferDescriptor::new(
+            Qtd::new(
                 TransferToken::new_active(PidCode::SetupToken, u15::new(8))
                     .with_interrupt_on_complete(true),
                 BufferPtrs::new_contiguous(
@@ -350,7 +352,7 @@ impl InitializedEhci {
                     8,
                 ),
             ),
-            QueueElementTransferDescriptor::new(
+            Qtd::new(
                 TransferToken::new_active(
                     PidCode::InToken,
                     u15::new(PAYLOAD_BUFFER_LEN.try_into().unwrap()),
@@ -363,7 +365,7 @@ impl InitializedEhci {
                     PAYLOAD_BUFFER_LEN.try_into().unwrap(),
                 ),
             ),
-            QueueElementTransferDescriptor::new(
+            Qtd::new(
                 TransferToken::new_active(PidCode::OutToken, u15::ZERO)
                     .with_data_toggle(true)
                     .with_interrupt_on_complete(true),

@@ -11,6 +11,7 @@ use crate::{
         AsyncListAddrReg, OperationalRegs, OperationalRegsVolatileFieldAccess, PortScReg, UsbStsReg,
     },
     periodic_list::PeriodicFrameListElement,
+    qtd::NextQtdPointer,
     queue_head::{
         EndpointCapabilities, EndpointCharacteristics, QueueHead, QueueHeadHorizontalLinkPtr,
         SelectType,
@@ -136,6 +137,7 @@ impl OsOwnedEhci {
             EndpointCharacteristics::ZERO.with_head_of_reclamation_list_flag(true),
             EndpointCapabilities::ZERO,
         );
+        qh.next_qtd_pointer = NextQtdPointer::INVALID;
         qh.queue_head_horizontal_link_ptr =
             QueueHeadHorizontalLinkPtr::new(SelectType::Qh, anchor_qh_mem.phys_addr);
         qh_ptr.write(qh);

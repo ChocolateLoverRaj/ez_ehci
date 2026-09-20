@@ -42,7 +42,7 @@ pub struct QtdBufferPagePointerPage1Plus {
 
 #[repr(C, align(32))]
 #[derive(Debug, Clone, Copy, VolatileFieldAccess)]
-pub struct QueueElementTransferDescriptor {
+pub struct Qtd {
     pub(crate) next_qtd_ptr: NextQtdPointer,
     pub(crate) alternate_next_qtd_ptr: AlternateQtdLinkPtr,
     pub(crate) qtd_token: TransferToken,
@@ -59,7 +59,7 @@ pub struct QueueElementTransferDescriptor {
     pub(crate) extended_buffer_ptr_page_4: u32,
 }
 
-impl QueueElementTransferDescriptor {
+impl Qtd {
     pub fn new(qtd_token: TransferToken, buffer_ptrs: BufferPtrs) -> Self {
         Self {
             next_qtd_ptr: NextQtdPointer::INVALID,
