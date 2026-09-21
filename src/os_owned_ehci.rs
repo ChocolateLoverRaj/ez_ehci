@@ -148,14 +148,11 @@ impl OsOwnedEhci {
             .usb_cmd()
             .update(|usb_cmd| usb_cmd.with_async_schedule_enable(true));
 
-        InitializedEhci {
-            capability_regs: self.capability_regs,
-            operational_regs: self.operational_regs,
-            port_sc_regs: self.port_sc_regs,
-            int_occurred: AtomicBool::new(false),
-            waker: AtomicWaker::new(),
-            async_advance_occurred: AtomicBool::new(false),
-            anchor_qh: anchor_qh_mem,
-        }
+        InitializedEhci::new(
+            self.capability_regs,
+            self.operational_regs,
+            self.port_sc_regs,
+            anchor_qh_mem,
+        )
     }
 }

@@ -3,10 +3,14 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use core::task::Poll;
 use core::{fmt::Debug, mem::offset_of};
 
+use alloc::boxed::Box;
+use alloc::sync::Arc;
+use alloc::{vec, vec::Vec};
 use arbitrary_int::{traits::Integer, u4, u7, u11, u12, u15, u20};
 use bitbybit::bitfield;
 use embedded_hal_async::delay::DelayNs;
 use futures::task::AtomicWaker;
+use intrusive_collections::{SinglyLinkedList, SinglyLinkedListAtomicLink, intrusive_adapter};
 use volatile::{VolatileFieldAccess, VolatilePtr, access::ReadOnly};
 use zerocopy::transmute;
 
@@ -39,19 +43,21 @@ use crate::{
 };
 
 struct QtdWatcher {
+    link: SinglyLinkedListAtomicLink,
     waker: AtomicWaker,
-    qtd_phys_addr: MappedMem<Qtd>,
+    qtd: VolatilePtr<'static, Qtd>,
 }
+
+intrusive_adapter!(QtdWatcherAdapter = Arc<QtdWatcher>: QtdWatcher { link => SinglyLinkedListAtomicLink });
 
 pub struct InitializedEhci {
     pub(crate) capability_regs: VolatilePtr<'static, CapabilityRegs, ReadOnly>,
     pub(crate) operational_regs: VolatilePtr<'static, OperationalRegs>,
     pub(crate) port_sc_regs: VolatilePtr<'static, [PortScReg]>,
-    pub(crate) int_occurred: AtomicBool,
-    pub(crate) waker: AtomicWaker,
-    pub(crate) async_advance_occurred: AtomicBool,
-    pub(crate) anchor_qh: MappedMem<QueueHead>,
-    pub(crate) qtds_to_watch: QtdWatcher,
+    pub anchor_qh: MappedMem<QueueHead>,
+    /// Each port has one.
+    pub wakers: Box<[AtomicWaker]>,
+    pub port_change_detect_waker: AtomicWaker,
 }
 
 /// Safety: safe to drop in different thread than it was created in.
@@ -82,9 +88,23 @@ pub enum InitDeviceError {
 }
 
 impl InitializedEhci {
-pub crate fn new(capability_regs: VolatilePtr<CapabilityRegs, ReadOnly>, operational_regs: VolatilePtr<OperationalRegs>, port_sc_regs: VolatilePtr<[PortScReg]>) -> Self {
-    Self { capability_regs, operational_regs, port_sc_regs, int_occurred: (), waker: (), async_advance_occurred: (), anchor_qh: (), qtds_to_watch: () }
-}
+    pub(crate) fn new(
+        capability_regs: VolatilePtr<'static, CapabilityRegs, ReadOnly>,
+        operational_regs: VolatilePtr<'static, OperationalRegs>,
+        port_sc_regs: VolatilePtr<'static, [PortScReg]>,
+        anchor_qh: MappedMem<QueueHead>,
+    ) -> Self {
+        Self {
+            capability_regs,
+            operational_regs,
+            port_sc_regs,
+            anchor_qh,
+            wakers: (0..capability_regs.hcs_params().read().n_ports().as_usize())
+                .map(|_| AtomicWaker::new())
+                .collect(),
+            port_change_detect_waker: AtomicWaker::new(),
+        }
+    }
     fn add_qh_to_async_list(&self, qh: MappedMem<QueueHead>) {
         let qh_ptr = unsafe { VolatilePtr::new(qh.ptr) };
         let anchor_qh_ptr = unsafe { VolatilePtr::new(self.anchor_qh.ptr) };
@@ -100,7 +120,8 @@ pub crate fn new(capability_regs: VolatilePtr<CapabilityRegs, ReadOnly>, operati
     }
 
     pub async fn run(&self) -> NewDeviceEvent {
-        loop {
+        future::poll_fn(|context| {
+            self.port_change_detect_waker.register(context.waker());
             // Check for devices
             for port in 0..self.capability_regs.hcs_params().read().n_ports().value() {
                 let port_sc_reg = self
@@ -108,20 +129,14 @@ pub crate fn new(capability_regs: VolatilePtr<CapabilityRegs, ReadOnly>, operati
                     .index(usize::try_from(port).unwrap())
                     .read();
                 if port_sc_reg.current_connect_status() {
-                    return NewDeviceEvent {
+                    return Poll::Ready(NewDeviceEvent {
                         port: u4::new(port).try_into().unwrap(),
-                    };
+                    });
                 }
             }
-            future::poll_fn(|context| {
-                self.waker.register(context.waker());
-                if self.int_occurred.swap(false, Ordering::Relaxed) {
-                    return Poll::Ready(());
-                }
-                Poll::Pending
-            })
-            .await;
-        }
+            Poll::Pending
+        })
+        .await
     }
 
     pub fn handle_interrupt(&self) {
@@ -135,15 +150,17 @@ pub crate fn new(capability_regs: VolatilePtr<CapabilityRegs, ReadOnly>, operati
             panic!("host system error");
         }
         if status.interrupt_on_async_advance() {
-            self.async_advance_occurred.store(true, Ordering::Relaxed);
-            self.waker.wake();
             clear.set_interrupt_on_async_advance(true);
         }
-        if status.port_change_detect() | status.usb_int() {
-            self.int_occurred.store(true, Ordering::Relaxed);
-            self.waker.wake();
+        if status.port_change_detect() {
             clear.set_port_change_detect(true);
+            self.port_change_detect_waker.wake();
+        }
+        if status.usb_int() {
             clear.set_usb_int(true);
+            for waker in &self.wakers {
+                waker.wake();
+            }
         }
         self.operational_regs.usb_sts().write(clear);
 
@@ -286,59 +303,42 @@ pub crate fn new(capability_regs: VolatilePtr<CapabilityRegs, ReadOnly>, operati
             ptr: buffer_ptr.qhs().as_slice().index(0).as_raw_ptr(),
         });
 
-        while buffer_ptr
-            .qtds()
-            .as_slice()
-            .index(0)
-            .read()
-            .qtd_token
-            .active()
-        {
+        future::poll_fn(|context| {
+            self.wakers[u4::from(root_port_number).as_usize()].register(context.waker());
+            if !buffer_ptr
+                .qtds()
+                .as_slice()
+                .index(0)
+                .qtd_token()
+                .read()
+                .active()
+            {
+                return Poll::Ready(());
+            }
             log::info!("awaiting usb int future");
-            future::poll_fn(|context| {
-                self.waker.register(context.waker());
-                if self.int_occurred.swap(false, Ordering::Relaxed) {
-                    return Poll::Ready(());
-                }
-                Poll::Pending
-            })
-            .await;
-        }
+            Poll::Pending
+        })
+        .await;
         log::info!("QTD 0 complete");
-        while buffer_ptr
-            .qtds()
-            .as_slice()
-            .index(1)
-            .read()
-            .qtd_token
-            .active()
-        {
+        future::poll_fn(|context| {
+            self.wakers[u4::from(root_port_number).as_usize()].register(context.waker());
+            if !buffer_ptr
+                .qtds()
+                .as_slice()
+                .index(1)
+                .qtd_token()
+                .read()
+                .active()
+            {
+                return Poll::Ready(());
+            }
             log::info!("awaiting usb int future");
-            future::poll_fn(|context| {
-                self.waker.register(context.waker());
-                if self.int_occurred.swap(false, Ordering::Relaxed) {
-                    return Poll::Ready(());
-                }
-                Poll::Pending
-            })
-            .await;
-        }
+            Poll::Pending
+        })
+        .await;
         log::info!("QTD 1 complete");
 
         delay.delay_ms(2).await;
-
-        // self.operational_regs
-        //     .usb_cmd()
-        //     .update(|usb_cmd| usb_cmd.with_interrupt_on_async_advance_doorbell(true));
-        // log::info!("waiting for interrupt on async advance");
-        // future::poll_fn(|context| {
-        //     self.waker.register(context.waker());
-        //     if self.async_advance_occurred.swap(false, Ordering::Relaxed) {
-        //         return Poll::Ready(());
-        //     }
-        //     Poll::Pending
-        // })
-        // .await;
 
         log::info!("Doing get descriptor");
         let mut qtds = [
@@ -401,62 +401,62 @@ pub crate fn new(capability_regs: VolatilePtr<CapabilityRegs, ReadOnly>, operati
             phys_addr: qhs_phys_addr + qh_size,
             ptr: buffer_ptr.qhs().as_slice().index(1).as_raw_ptr(),
         });
-
-        while buffer_ptr
-            .qtds()
-            .as_slice()
-            .index(2)
-            .read()
-            .qtd_token
-            .active()
-        {
+        future::poll_fn(|context| {
+            self.wakers[u4::from(root_port_number).as_usize()].register(context.waker());
+            if !buffer_ptr
+                .qtds()
+                .as_slice()
+                .index(2)
+                .qtd_token()
+                .read()
+                .active()
+            {
+                return Poll::Ready(());
+            }
             log::info!("awaiting usb int future");
-            future::poll_fn(|context| {
-                self.waker.register(context.waker());
-                if self.int_occurred.swap(false, Ordering::Relaxed) {
-                    return Poll::Ready(());
-                }
-                Poll::Pending
-            })
-            .await;
-        }
+            Poll::Pending
+        })
+        .await;
         log::info!("QTD 2 complete");
         let qtd_3_ptr = buffer_ptr.qtds().as_slice().index(3);
-        while qtd_3_ptr.read().qtd_token.active() {
+        future::poll_fn(|context| {
+            self.wakers[u4::from(root_port_number).as_usize()].register(context.waker());
+            if !buffer_ptr
+                .qtds()
+                .as_slice()
+                .index(3)
+                .qtd_token()
+                .read()
+                .active()
+            {
+                return Poll::Ready(());
+            }
             log::info!("awaiting usb int future");
-            future::poll_fn(|context| {
-                self.waker.register(context.waker());
-                if self.int_occurred.swap(false, Ordering::Relaxed) {
-                    return Poll::Ready(());
-                }
-                Poll::Pending
-            })
-            .await;
-        }
+            Poll::Pending
+        })
+        .await;
         let bytes_to_transfer = qtd_3_ptr.qtd_token().read().total_bytes_to_transfer();
         let bytes_transferred =
             u15::new(PAYLOAD_BUFFER_LEN.try_into().unwrap()) - bytes_to_transfer;
         let buffer = buffer_ptr.descriptor_buffer().read();
         let bytes = &buffer[..usize::try_from(bytes_transferred.value()).unwrap()];
         log::info!("QTD 3 complete. read: {bytes:02X?}");
-        while buffer_ptr
-            .qtds()
-            .as_slice()
-            .index(4)
-            .read()
-            .qtd_token
-            .active()
-        {
+        future::poll_fn(|context| {
+            self.wakers[u4::from(root_port_number).as_usize()].register(context.waker());
+            if !buffer_ptr
+                .qtds()
+                .as_slice()
+                .index(4)
+                .qtd_token()
+                .read()
+                .active()
+            {
+                return Poll::Ready(());
+            }
             log::info!("awaiting usb int future");
-            future::poll_fn(|context| {
-                self.waker.register(context.waker());
-                if self.int_occurred.swap(false, Ordering::Relaxed) {
-                    return Poll::Ready(());
-                }
-                Poll::Pending
-            })
-            .await;
-        }
+            Poll::Pending
+        })
+        .await;
         log::info!("QTD 4 complete");
         todo!()
     }

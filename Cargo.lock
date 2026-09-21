@@ -49,6 +49,7 @@ dependencies = [
  "debug-ignore",
  "embedded-hal-async",
  "futures",
+ "intrusive-collections",
  "log",
  "num_enum",
  "volatile",
@@ -114,6 +115,12 @@ dependencies = [
  "futures-task",
  "pin-project-lite",
 ]
+
+[[package]]
+name = "intrusive-collections"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4275b20e6057cd7733fd8df8a5a31701e4fe44497dad0f3fa0e1c4fb971506be"
 
 [[package]]
 name = "log"
