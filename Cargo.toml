@@ -12,5 +12,6 @@ futures = { version = "0.3.34", default-features = false }
 intrusive-collections = "0.10.3"
 log = "0.4.34"
 num_enum = { version = "0.7.6", default-features = false }
+spinning_top = "0.3.0"
 volatile = { version = "0.6.1", features = ["derive", "unstable"] }
 zerocopy = { version = "0.8.57", default-features = false, features = ["derive"] }

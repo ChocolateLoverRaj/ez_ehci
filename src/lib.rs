@@ -3,13 +3,17 @@ extern crate alloc;
 
 mod buffer_ptrs;
 mod capability_regs;
+mod device;
+mod device_greeter;
 mod endpoint_speed;
 mod initialized_ehci;
+mod irq_handler;
 mod new_ehci;
 mod operational_regs;
 mod os_owned_ehci;
 mod pci;
 mod periodic_list;
+mod qh_manager;
 mod qtd;
 mod queue_head;
 mod root_port_number;
@@ -17,19 +21,25 @@ mod setup_packet;
 mod transfer_token;
 mod usb_leg_sup;
 
-use core::{fmt::Debug, mem::offset_of, num::NonZero, ptr::NonNull};
+use core::{fmt::Debug, num::NonZero, ptr::NonNull};
 
 use bitbybit::bitfield;
-use volatile::{VolatileFieldAccess, VolatilePtr, access::ReadOnly};
+use volatile::{VolatilePtr, access::ReadOnly};
 
 use crate::capability_regs::{CapabilityRegs, CapabilityRegsVolatileFieldAccess};
-pub use crate::initialized_ehci::{InitDeviceBuffer, InitializedEhci, NewDeviceEvent};
-pub use crate::new_ehci::{AnyEhci, new_ehci};
-pub use crate::os_owned_ehci::OsOwnedEhci;
-pub use crate::pci::{PCI_CLASS, PCI_PROG_IF, PCI_SUBCLASS, PciAccess};
-pub use crate::periodic_list::PeriodicFrameList;
-pub use crate::queue_head::QueueHead;
-pub use crate::usb_leg_sup::{BiosOwnedEhci, TakingOwnershipEhci, TryTakeOutput};
+use crate::device_greeter::PortChangeDetectWaker;
+use crate::qh_manager::QhManager;
+pub use crate::{
+    device_greeter::{DeviceGreeterFoundDevice, DeviceGreeterWaitingForDevice},
+    initialized_ehci::{InitDeviceBuffer, InitializedEhci, NewDeviceEvent},
+    irq_handler::IrqHandler,
+    new_ehci::{AnyEhci, new_ehci},
+    os_owned_ehci::{EhciParts, OsOwnedEhci},
+    pci::{PCI_CLASS, PCI_PROG_IF, PCI_SUBCLASS, PciAccess},
+    periodic_list::PeriodicFrameList,
+    queue_head::QueueHead,
+    usb_leg_sup::{BiosOwnedEhci, TakingOwnershipEhci, TryTakeOutput},
+};
 
 #[derive(Debug, Clone, Copy)]
 pub struct MappedMem<T> {

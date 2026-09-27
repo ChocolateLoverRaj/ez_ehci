@@ -1,5 +1,5 @@
 use core::future::{self};
-use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicU16, Ordering};
 use core::task::Poll;
 use core::{fmt::Debug, mem::offset_of};
 
@@ -55,9 +55,9 @@ pub struct InitializedEhci {
     pub(crate) operational_regs: VolatilePtr<'static, OperationalRegs>,
     pub(crate) port_sc_regs: VolatilePtr<'static, [PortScReg]>,
     pub anchor_qh: MappedMem<QueueHead>,
-    /// Each port has one.
-    pub wakers: Box<[AtomicWaker]>,
+    pub port_wakers: Box<[AtomicWaker]>,
     pub port_change_detect_waker: AtomicWaker,
+    pub initialized_ports: AtomicU16,
 }
 
 /// Safety: safe to drop in different thread than it was created in.
@@ -99,10 +99,11 @@ impl InitializedEhci {
             operational_regs,
             port_sc_regs,
             anchor_qh,
-            wakers: (0..capability_regs.hcs_params().read().n_ports().as_usize())
+            port_wakers: (0..capability_regs.hcs_params().read().n_ports().as_usize())
                 .map(|_| AtomicWaker::new())
                 .collect(),
             port_change_detect_waker: AtomicWaker::new(),
+            initialized_ports: AtomicU16::new(0),
         }
     }
     fn add_qh_to_async_list(&self, qh: MappedMem<QueueHead>) {
@@ -120,15 +121,21 @@ impl InitializedEhci {
     }
 
     pub async fn run(&self) -> NewDeviceEvent {
+        let initialize_ports = self.initialized_ports.load(Ordering::Relaxed);
         future::poll_fn(|context| {
             self.port_change_detect_waker.register(context.waker());
             // Check for devices
             for port in 0..self.capability_regs.hcs_params().read().n_ports().value() {
+                if initialize_ports & (1 << port) != 0 {
+                    continue;
+                }
                 let port_sc_reg = self
                     .port_sc_regs
                     .index(usize::try_from(port).unwrap())
                     .read();
                 if port_sc_reg.current_connect_status() {
+                    self.initialized_ports
+                        .store(initialize_ports | (1 << port), Ordering::Relaxed);
                     return Poll::Ready(NewDeviceEvent {
                         port: u4::new(port).try_into().unwrap(),
                     });
@@ -158,7 +165,7 @@ impl InitializedEhci {
         }
         if status.usb_int() {
             clear.set_usb_int(true);
-            for waker in &self.wakers {
+            for waker in &self.port_wakers {
                 waker.wake();
             }
         }
@@ -187,11 +194,6 @@ impl InitializedEhci {
         buffer: MappedMem<InitDeviceBuffer>,
         delay: &mut impl DelayNs,
     ) -> Result<(), InitDeviceError> {
-        for _ in 0..10 {
-            delay.delay_ms(2).await;
-            log::info!("did test delay");
-        }
-
         let port_sc_reg = self
             .port_sc_regs
             .index(usize::try_from(u4::from(root_port_number).value()).unwrap());
@@ -213,30 +215,6 @@ impl InitializedEhci {
         log::info!("Waiting for port to be enabled");
         delay.delay_ms(2).await;
         log::info!("delay of 2ms done");
-        // let timeout = delay.delay_ms(2);
-        // let mut timeout_pinned = pin!(timeout);
-        // let port_enabled = loop {
-        //     let int_future = future::poll_fn(|context| {
-        //         self.waker.register(context.waker());
-        //         if self.int_occurred.swap(false, Ordering::Relaxed) {
-        //             return Poll::Ready(());
-        //         }
-        //         Poll::Pending
-        //     });
-        //     match select(timeout_pinned, int_future).await {
-        //         Either::Left(_) => {
-        //             log::info!("2ms timer over, checking if port enabled");
-        //             break port_sc_reg.read().port_enabled();
-        //         }
-        //         Either::Right((_, r_timeout)) => {
-        //             if port_sc_reg.read().port_enabled() {
-        //                 log::info!("port enabled, detected from interrupt");
-        //                 break true;
-        //             }
-        //             timeout_pinned = r_timeout;
-        //         }
-        //     }
-        // };
         let port_enabled = port_sc_reg.read().port_enabled();
         if !port_enabled {
             // The port will be disabled if the device isn't high speed
@@ -304,7 +282,7 @@ impl InitializedEhci {
         });
 
         future::poll_fn(|context| {
-            self.wakers[u4::from(root_port_number).as_usize()].register(context.waker());
+            self.port_wakers[u4::from(root_port_number).as_usize()].register(context.waker());
             if !buffer_ptr
                 .qtds()
                 .as_slice()
@@ -321,7 +299,7 @@ impl InitializedEhci {
         .await;
         log::info!("QTD 0 complete");
         future::poll_fn(|context| {
-            self.wakers[u4::from(root_port_number).as_usize()].register(context.waker());
+            self.port_wakers[u4::from(root_port_number).as_usize()].register(context.waker());
             if !buffer_ptr
                 .qtds()
                 .as_slice()
@@ -402,7 +380,7 @@ impl InitializedEhci {
             ptr: buffer_ptr.qhs().as_slice().index(1).as_raw_ptr(),
         });
         future::poll_fn(|context| {
-            self.wakers[u4::from(root_port_number).as_usize()].register(context.waker());
+            self.port_wakers[u4::from(root_port_number).as_usize()].register(context.waker());
             if !buffer_ptr
                 .qtds()
                 .as_slice()
@@ -420,7 +398,7 @@ impl InitializedEhci {
         log::info!("QTD 2 complete");
         let qtd_3_ptr = buffer_ptr.qtds().as_slice().index(3);
         future::poll_fn(|context| {
-            self.wakers[u4::from(root_port_number).as_usize()].register(context.waker());
+            self.port_wakers[u4::from(root_port_number).as_usize()].register(context.waker());
             if !buffer_ptr
                 .qtds()
                 .as_slice()
@@ -442,7 +420,7 @@ impl InitializedEhci {
         let bytes = &buffer[..usize::try_from(bytes_transferred.value()).unwrap()];
         log::info!("QTD 3 complete. read: {bytes:02X?}");
         future::poll_fn(|context| {
-            self.wakers[u4::from(root_port_number).as_usize()].register(context.waker());
+            self.port_wakers[u4::from(root_port_number).as_usize()].register(context.waker());
             if !buffer_ptr
                 .qtds()
                 .as_slice()
@@ -458,7 +436,7 @@ impl InitializedEhci {
         })
         .await;
         log::info!("QTD 4 complete");
-        todo!()
+        Ok(())
     }
 }
 

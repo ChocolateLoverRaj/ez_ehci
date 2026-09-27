@@ -26,6 +26,11 @@ impl QueueHeadHorizontalLinkPtr {
             .with_pointer_type(select_type.into())
             .with_ptr_upper(u27::new(ptr >> 5))
     }
+
+    /// Assumes it is valid
+    pub fn ptr(&self) -> u32 {
+        self.ptr_upper().value() << 5
+    }
 }
 
 #[repr(u8)]
@@ -181,17 +186,12 @@ impl QueueHead {
         }
     }
 
-    pub fn link_contiguous_qtds(
-        &mut self,
-        qtds: &mut [Qtd],
-        phys_addr: u32,
-    ) {
+    pub fn link_contiguous_qtds(&mut self, qtds: &mut [Qtd], phys_addr: u32) {
         self.next_qtd_pointer = NextQtdPointer::new_valid(phys_addr);
         for i in 0..qtds.len() - 1 {
             qtds[i].next_qtd_ptr = NextQtdPointer::new_valid(
                 phys_addr
-                    + u32::try_from(i + 1).unwrap()
-                        * u32::try_from(size_of::<Qtd>()).unwrap(),
+                    + u32::try_from(i + 1).unwrap() * u32::try_from(size_of::<Qtd>()).unwrap(),
             )
         }
     }

@@ -1,22 +1,31 @@
 use core::{hint, ptr::NonNull, sync::atomic::AtomicBool};
 
+use alloc::sync::Arc;
 use arbitrary_int::{traits::Integer, u2};
 use futures::task::AtomicWaker;
 use volatile::{VolatilePtr, access::ReadOnly};
 
 use crate::{
     InitializedEhci, MappedMem, PeriodicFrameList,
-    capability_regs::CapabilityRegs,
+    capability_regs::{CapabilityRegs, CapabilityRegsVolatileFieldAccess},
+    device_greeter::{AssignAddrBuffer, DeviceGreeterWaitingForDevice, PortChangeDetectWaker},
+    irq_handler::{IrqHandler, UsbIntWakers},
     operational_regs::{
         AsyncListAddrReg, OperationalRegs, OperationalRegsVolatileFieldAccess, PortScReg, UsbStsReg,
     },
     periodic_list::PeriodicFrameListElement,
+    qh_manager::{QhManager, QhWithMetadata},
     qtd::NextQtdPointer,
     queue_head::{
         EndpointCapabilities, EndpointCharacteristics, QueueHead, QueueHeadHorizontalLinkPtr,
         SelectType,
     },
 };
+
+pub struct EhciParts {
+    pub device_greeter: DeviceGreeterWaitingForDevice,
+    pub irq_handler: IrqHandler,
+}
 
 pub struct OsOwnedEhci {
     capability_regs: VolatilePtr<'static, CapabilityRegs, ReadOnly>,
@@ -62,8 +71,9 @@ impl OsOwnedEhci {
     pub fn init(
         self,
         periodic_frame_list_mem: MappedMem<PeriodicFrameList>,
-        anchor_qh_mem: MappedMem<QueueHead>,
-    ) -> InitializedEhci {
+        anchor_qh_mem: MappedMem<QhWithMetadata>,
+        greeter_buffer: MappedMem<AssignAddrBuffer>,
+    ) -> EhciParts {
         // Halt
         log::info!("Halting eHCI");
         self.operational_regs
@@ -98,6 +108,7 @@ impl OsOwnedEhci {
                 .with_usb_error_interrupt_enable(true)
                 .with_port_change_interrupt_enable(true)
                 .with_host_system_error_interrupt_enable(true)
+                .with_interrupt_on_async_advance_enable(true)
         });
         // Clear pending interrupts
         self.operational_regs.usb_sts().write(
@@ -140,7 +151,11 @@ impl OsOwnedEhci {
         qh.next_qtd_pointer = NextQtdPointer::INVALID;
         qh.queue_head_horizontal_link_ptr =
             QueueHeadHorizontalLinkPtr::new(SelectType::Qh, anchor_qh_mem.phys_addr);
-        qh_ptr.write(qh);
+        qh_ptr.write(QhWithMetadata {
+            qh,
+            next: qh_ptr,
+            prev: qh_ptr,
+        });
         self.operational_regs
             .async_list_addr()
             .write(AsyncListAddrReg::new(anchor_qh_mem.phys_addr));
@@ -148,11 +163,30 @@ impl OsOwnedEhci {
             .usb_cmd()
             .update(|usb_cmd| usb_cmd.with_async_schedule_enable(true));
 
-        InitializedEhci::new(
-            self.capability_regs,
-            self.operational_regs,
-            self.port_sc_regs,
-            anchor_qh_mem,
-        )
+        let port_change_detect_waker = PortChangeDetectWaker::new(AtomicWaker::new());
+        let n_ports = self.capability_regs.hcs_params().read().n_ports();
+        let port_sc_regs = self.port_sc_regs;
+        let port_wakers: UsbIntWakers = (0..n_ports.value()).map(|_| AtomicWaker::new()).collect();
+        let operational_regs = self.operational_regs;
+        let qh_manager = Arc::new(QhManager::new(anchor_qh_mem, n_ports, operational_regs));
+
+        EhciParts {
+            device_greeter: DeviceGreeterWaitingForDevice::new(
+                port_change_detect_waker.clone(),
+                n_ports,
+                port_sc_regs,
+                port_wakers.clone(),
+                qh_manager.clone(),
+                greeter_buffer,
+            ),
+            irq_handler: IrqHandler::new(
+                n_ports,
+                port_change_detect_waker,
+                operational_regs,
+                port_sc_regs,
+                port_wakers,
+                qh_manager,
+            ),
+        }
     }
 }
