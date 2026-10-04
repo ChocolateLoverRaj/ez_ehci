@@ -1,7 +1,7 @@
-use core::{future, mem::offset_of, task::Poll};
+use core::{future, mem::offset_of, ops::Index, task::Poll};
 
 use alloc::{string::String, sync::Arc, vec::Vec};
-use arbitrary_int::{traits::Integer, u4, u7, u11, u15};
+use arbitrary_int::{traits::Integer, u2, u4, u7, u11, u15};
 use volatile::{VolatileFieldAccess, VolatilePtr};
 use zerocopy::{FromBytes, Immutable, KnownLayout, transmute};
 
@@ -148,7 +148,7 @@ impl Device {
                 TransferToken::new_active(PidCode::OutToken, u15::ZERO)
                     .with_data_toggle(true)
                     .with_interrupt_on_complete(true),
-                BufferPtrs::EMPTY,
+                BufferPtrs::ZERO,
             ),
         ];
         let mut qh = QueueHead::new(
@@ -252,7 +252,7 @@ impl Device {
                 TransferToken::new_active(PidCode::OutToken, u15::ZERO)
                     .with_data_toggle(true)
                     .with_interrupt_on_complete(true),
-                BufferPtrs::EMPTY,
+                BufferPtrs::ZERO,
             ),
         ];
         setup_packet_ptr.write(transmute!(SetupPacket::new_get_configuration_descriptor(
@@ -426,5 +426,64 @@ impl Device {
             serial_number: None,
             usb_version: transmute!(device_descriptor.bcd_usb),
         }
+    }
+
+    pub async fn do_setup_transfer(
+        &mut self,
+        qh_mem: MappedMem<QhWithMetadata>,
+        qtds_mem: MappedMem<[Qtd; 2]>,
+        setup_packet_mem: MappedMem<[u8; 8]>,
+    ) {
+        let qh_ptr = unsafe { VolatilePtr::new(qh_mem.ptr) };
+        let qtds_ptr = unsafe { VolatilePtr::new(qtds_mem.ptr) };
+        let mut qh = QueueHead::new(
+            EndpointCharacteristics::builder()
+                .with_device_addr(self.addr)
+                .with_inactive_on_next_transaction(false)
+                .with_endpoint_number(u4::ZERO)
+                .with_endpoint_speed(EndpointSpeed::High.into())
+                .with_data_toggle_control(false)
+                .with_head_of_reclamation_list_flag(false)
+                .with_max_packet_len(u11::new(8))
+                .with_endpoint_control_flag(false)
+                .with_nak_count_reload(u4::ZERO)
+                .build(),
+            EndpointCapabilities::ZERO,
+        );
+        let mut qtds = [
+            Qtd::new(
+                TransferToken::new_active(PidCode::SetupToken, u15::new(8)),
+                BufferPtrs::new_contiguous(setup_packet_mem.phys_addr.into(), 8),
+            ),
+            Qtd::new(
+                TransferToken::new_active(PidCode::InToken, u15::ZERO)
+                    .with_data_toggle(true)
+                    .with_interrupt_on_complete(true),
+                BufferPtrs::ZERO,
+            ),
+        ];
+        qh.link_contiguous_qtds(&mut qtds, qtds_mem.phys_addr);
+        qh_ptr.qh().write(qh);
+        qtds_ptr.write(qtds);
+        self.qh_manager.add_qh_to_async_list(qh_mem);
+        self.wait_for_qtd(qtds_ptr.as_slice().index(1)).await;
+        self.qh_manager
+            .remove_qh(qh_mem, self.root_port_number.into())
+            .await;
+    }
+
+    pub async fn set_configuration(
+        &mut self,
+        configuration_number: u8,
+        qh_mem: MappedMem<QhWithMetadata>,
+        qtds_mem: MappedMem<[Qtd; 2]>,
+        setup_packet_mem: MappedMem<[u8; 8]>,
+    ) {
+        let setup_packet_ptr = unsafe { VolatilePtr::new(setup_packet_mem.ptr) };
+        setup_packet_ptr.write(transmute!(SetupPacket::new_set_configuration(
+            configuration_number
+        )));
+        self.do_setup_transfer(qh_mem, qtds_mem, setup_packet_mem)
+            .await;
     }
 }

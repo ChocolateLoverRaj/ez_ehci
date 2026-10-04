@@ -245,7 +245,7 @@ impl InitializedEhci {
                 TransferToken::new_active(PidCode::InToken, u15::ZERO)
                     .with_interrupt_on_complete(true)
                     .with_data_toggle(true),
-                BufferPtrs::EMPTY,
+                BufferPtrs::ZERO,
             ),
         ];
         let mut qh = QueueHead::new(
@@ -346,7 +346,7 @@ impl InitializedEhci {
                 TransferToken::new_active(PidCode::OutToken, u15::ZERO)
                     .with_data_toggle(true)
                     .with_interrupt_on_complete(true),
-                BufferPtrs::EMPTY,
+                BufferPtrs::ZERO,
             ),
         ];
         let mut qh = QueueHead::new(

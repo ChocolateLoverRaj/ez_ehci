@@ -26,7 +26,7 @@ impl BufferPtrs {
         }
     }
 
-    pub const EMPTY: Self = Self {
+    pub const ZERO: Self = Self {
         ptrs: [0; _],
         offset: u12::ZERO,
     };

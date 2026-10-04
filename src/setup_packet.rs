@@ -56,6 +56,21 @@ impl SetupPacket {
             w_length: 0_u16.to_le_bytes(),
         }
     }
+
+    pub fn new_set_configuration(configuration_number: u8) -> Self {
+        Self {
+            bm_request_type: BmRequestType::builder()
+                .with_recipient(Recipient::Device.into())
+                .with_request_type(RequestType::Standard.into())
+                .with_direction(Direction::HostToDeviceOrNoDataTransfer.into())
+                .build()
+                .raw_value(),
+            b_request: BRequest::SetConfiguration.into(),
+            w_value: [configuration_number, 0],
+            w_index: 0_u16.to_le_bytes(),
+            w_length: 0_u16.to_le_bytes(),
+        }
+    }
 }
 
 #[bitfield(u8, debug)]
