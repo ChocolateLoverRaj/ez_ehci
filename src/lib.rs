@@ -3,10 +3,15 @@ extern crate alloc;
 
 mod buffer_ptrs;
 mod capability_regs;
+mod common_descriptor;
+mod configuration_descriptor;
 mod device;
+mod device_descriptor;
 mod device_greeter;
+mod endpoint_descriptor;
 mod endpoint_speed;
 mod initialized_ehci;
+mod interface_descriptor;
 mod irq_handler;
 mod new_ehci;
 mod operational_regs;
@@ -27,10 +32,10 @@ use bitbybit::bitfield;
 use volatile::{VolatilePtr, access::ReadOnly};
 
 use crate::capability_regs::{CapabilityRegs, CapabilityRegsVolatileFieldAccess};
-use crate::device_greeter::PortChangeDetectWaker;
-use crate::qh_manager::QhManager;
 pub use crate::{
-    device_greeter::{DeviceGreeterFoundDevice, DeviceGreeterWaitingForDevice},
+    device::{Device, GetInfoBuffer},
+    device_descriptor::DeviceDescriptor,
+    device_greeter::DeviceGreeterWaitingForDevice,
     initialized_ehci::{InitDeviceBuffer, InitializedEhci, NewDeviceEvent},
     irq_handler::IrqHandler,
     new_ehci::{AnyEhci, new_ehci},

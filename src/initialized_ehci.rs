@@ -199,7 +199,6 @@ impl InitializedEhci {
             .index(usize::try_from(u4::from(root_port_number).value()).unwrap());
 
         let port_sc = port_sc_reg.read();
-        log::debug!("Port SC: {port_sc:#X?}");
         if !port_sc.current_connect_status() {
             return Err(InitDeviceError::NotConncected);
         }
@@ -373,7 +372,7 @@ impl InitializedEhci {
             .copy_from_slice(&qtds);
         buffer_ptr.qhs().as_slice().index(1).write(qh);
         buffer_ptr.get_descriptor_setup_packet().write(transmute!(
-            SetupPacket::new_get_descriptor(PAYLOAD_BUFFER_LEN.try_into().unwrap(),)
+            SetupPacket::new_get_device_descriptor(PAYLOAD_BUFFER_LEN.try_into().unwrap(),)
         ));
         self.add_qh_to_async_list(MappedMem {
             phys_addr: qhs_phys_addr + qh_size,

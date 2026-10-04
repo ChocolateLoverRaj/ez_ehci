@@ -14,7 +14,7 @@ pub struct SetupPacket {
 }
 
 impl SetupPacket {
-    pub fn new_get_descriptor(w_length: u16) -> Self {
+    pub fn new_get_device_descriptor(w_length: u16) -> Self {
         Self {
             bm_request_type: BmRequestType::new_with_raw_value(0)
                 .with_recipient(Recipient::Device.into())
@@ -23,6 +23,21 @@ impl SetupPacket {
                 .raw_value(),
             b_request: BRequest::GetDescriptor.into(),
             w_value: [0x00, DescriptorType::Device.into()],
+            w_index: 0_u16.to_le_bytes(),
+            w_length: w_length.to_le_bytes(),
+        }
+    }
+
+    pub fn new_get_configuration_descriptor(w_length: u16, num: u8) -> Self {
+        Self {
+            bm_request_type: BmRequestType::builder()
+                .with_recipient(Recipient::Device.into())
+                .with_request_type(RequestType::Standard.into())
+                .with_direction(Direction::DeviceToHost.into())
+                .build()
+                .raw_value(),
+            b_request: BRequest::GetDescriptor.into(),
+            w_value: [num, DescriptorType::Configuration.into()],
             w_index: 0_u16.to_le_bytes(),
             w_length: w_length.to_le_bytes(),
         }
@@ -110,4 +125,11 @@ pub enum BRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, IntoPrimitive, TryFromPrimitive)]
 pub enum DescriptorType {
     Device = 1,
+    Configuration = 2,
+    String = 3,
+    Interface = 4,
+    Endpoint = 5,
+    DeviceQualifier = 6,
+    OtherSpeedConfiguration = 7,
+    InterfacePower = 8,
 }

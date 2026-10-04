@@ -46,26 +46,30 @@ impl IrqHandler {
     /// This function will not allocate. This function will try to finish as soon as possible to maintain system responsiveness.
     pub fn handle_irq(&mut self) {
         let status = self.operational_regs.usb_sts().read();
-        log::debug!("eHCI interrupt. Status: {status:#X?}");
         // TODO: This can make us exit our 2ms wait early.
         let mut clear = UsbStsReg::new_with_raw_value(0).with_frame_list_rollover(true);
-        if status.usb_err_int() {
-            panic!("usb err int");
-        } else if status.host_system_error() {
+        if status.host_system_error() {
             panic!("host system error");
         }
+        if status.usb_err_int() {
+            log::error!("eHCI error interrupt");
+            clear.set_usb_err_int(true);
+            for waker in self.port_wakers.iter() {
+                waker.wake();
+            }
+        }
         if status.interrupt_on_async_advance() {
-            log::info!("INTERRUPT ON ASYNC ADVANCE!");
+            log::trace!("INTERRUPT ON ASYNC ADVANCE!");
             self.qh_manager.handle_async_advance();
             clear.set_interrupt_on_async_advance(true);
         }
         if status.port_change_detect() {
-            log::info!("PORT CHANGE DETECT INT!");
+            log::trace!("PORT CHANGE DETECT INT!");
             clear.set_port_change_detect(true);
             self.port_change_detect_waker.wake();
         }
         if status.usb_int() {
-            log::info!("USB INT!");
+            log::trace!("USB INT!");
             clear.set_usb_int(true);
             for waker in self.port_wakers.iter() {
                 waker.wake();

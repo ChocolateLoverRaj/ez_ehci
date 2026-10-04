@@ -107,6 +107,14 @@ pub struct AlternateQtdLinkPtr {
 
 impl AlternateQtdLinkPtr {
     pub const INVALID: Self = Self::new_with_raw_value(0).with_terminate(true);
+
+    pub fn new(ptr: u32) -> Self {
+        Self::builder()
+            .with_terminate(false)
+            .with_nak_count(u4::new(0))
+            .with_ptr_upper(u27::new(ptr >> 5))
+            .build()
+    }
 }
 
 #[bitfield(u32, debug)]
