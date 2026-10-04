@@ -142,6 +142,11 @@ impl OsOwnedEhci {
             .update(|config_flag| config_flag.with_configure_flag(true));
         log::info!("Initialized CONFIGFLAG");
 
+        // Start the periodic list
+        self.operational_regs
+            .usb_cmd()
+            .update(|usb_cmd| usb_cmd.with_periodic_schedule_enable(true));
+
         // Initialize the async schedule
         let qh_ptr = unsafe { VolatilePtr::new(anchor_qh_mem.ptr) };
         let mut qh = QueueHead::new(
@@ -178,6 +183,7 @@ impl OsOwnedEhci {
                 port_wakers.clone(),
                 qh_manager.clone(),
                 greeter_buffer,
+                periodic_frame_list,
             ),
             irq_handler: IrqHandler::new(
                 n_ports,

@@ -8,7 +8,7 @@ use volatile::{VolatileFieldAccess, VolatilePtr};
 use zerocopy::transmute;
 
 use crate::{
-    MappedMem, QueueHead,
+    MappedMem, PeriodicFrameList, QueueHead,
     buffer_ptrs::BufferPtrs,
     device::Device,
     endpoint_speed::EndpointSpeed,
@@ -38,6 +38,7 @@ pub struct DeviceGreeterWaitingForDevice {
     port_wakers: UsbIntWakers,
     qh_manager: Arc<QhManager>,
     buffer: MappedMem<AssignAddrBuffer>,
+    periodic_list: VolatilePtr<'static, PeriodicFrameList>,
 }
 
 impl DeviceGreeterWaitingForDevice {
@@ -48,6 +49,7 @@ impl DeviceGreeterWaitingForDevice {
         port_wakers: UsbIntWakers,
         qh_manager: Arc<QhManager>,
         buffer: MappedMem<AssignAddrBuffer>,
+        periodic_list: VolatilePtr<'static, PeriodicFrameList>,
     ) -> Self {
         Self {
             initialized_ports: 0,
@@ -58,6 +60,7 @@ impl DeviceGreeterWaitingForDevice {
             port_wakers,
             qh_manager,
             buffer,
+            periodic_list,
         }
     }
 
@@ -213,6 +216,7 @@ impl DeviceGreeterWaitingForDevice {
             port_sc_reg,
             port_wakers: self.port_wakers.clone(),
             qh_manager: self.qh_manager.clone(),
+            periodic_list: self.periodic_list,
         }
     }
 }

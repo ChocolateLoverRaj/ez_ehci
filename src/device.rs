@@ -1,4 +1,4 @@
-use core::{future, mem::offset_of, ops::Index, task::Poll};
+use core::{array, future, mem::offset_of, ops::Index, ptr::NonNull, task::Poll};
 
 use alloc::{string::String, sync::Arc, vec::Vec};
 use arbitrary_int::{traits::Integer, u2, u4, u7, u11, u15};
@@ -6,7 +6,7 @@ use volatile::{VolatileFieldAccess, VolatilePtr};
 use zerocopy::{FromBytes, Immutable, KnownLayout, transmute};
 
 use crate::{
-    DeviceDescriptor, MappedMem, QueueHead,
+    DeviceDescriptor, MappedMem, PeriodicFrameList, QueueHead,
     buffer_ptrs::BufferPtrs,
     common_descriptor::CommonDescriptor,
     configuration_descriptor::ConfigurationDescriptor,
@@ -17,9 +17,10 @@ use crate::{
     interface_descriptor::InterfaceDescriptor,
     irq_handler::UsbIntWakers,
     operational_regs::PortScReg,
+    periodic_list::{PeriodicFrameListElement, PeriodicFrameListVolatileFieldAccess},
     qh_manager::{QhManager, QhWithMetadata, QhWithMetadataVolatileFieldAccess},
     qtd::{Qtd, QtdVolatileFieldAccess},
-    queue_head::{AlternateQtdLinkPtr, EndpointCapabilities, EndpointCharacteristics},
+    queue_head::{AlternateQtdLinkPtr, EndpointCapabilities, EndpointCharacteristics, SelectType},
     root_port_number::RootPortNumber,
     setup_packet::{DescriptorType, SetupPacket},
     transfer_token::{PidCode, TransferToken},
@@ -105,6 +106,7 @@ pub struct Device {
     pub(crate) addr: u7,
     pub(crate) qh_manager: Arc<QhManager>,
     pub(crate) port_wakers: UsbIntWakers,
+    pub(crate) periodic_list: VolatilePtr<'static, PeriodicFrameList>,
 }
 
 impl Device {
@@ -114,7 +116,6 @@ impl Device {
             if !qtd.qtd_token().read().active() {
                 return Poll::Ready(());
             }
-            log::info!("awaiting usb int future");
             Poll::Pending
         })
         .await;
@@ -485,5 +486,65 @@ impl Device {
         )));
         self.do_setup_transfer(qh_mem, qtds_mem, setup_packet_mem)
             .await;
+    }
+
+    pub async fn dev(
+        &mut self,
+        qh_mem: MappedMem<QueueHead>,
+        qtds_mem: MappedMem<[Qtd; 6]>,
+        buffer_mem: MappedMem<[u8; 8 * 6]>,
+    ) {
+        let qh_ptr = unsafe { VolatilePtr::new(qh_mem.ptr) };
+        let qtds_ptr = unsafe { VolatilePtr::new(qtds_mem.ptr) };
+        let mut qh = QueueHead::new(
+            EndpointCharacteristics::builder()
+                .with_device_addr(self.addr)
+                .with_inactive_on_next_transaction(false)
+                .with_endpoint_number(u4::new(1))
+                .with_endpoint_speed(EndpointSpeed::High.into())
+                .with_data_toggle_control(false)
+                .with_head_of_reclamation_list_flag(false)
+                .with_max_packet_len(u11::new(8))
+                .with_endpoint_control_flag(false)
+                .with_nak_count_reload(u4::ZERO)
+                .build(),
+            EndpointCapabilities::builder()
+                .with_interrupt_schedule_mask(u8::new(1))
+                .with_split_completion_mask(0)
+                .with_hub_addr(u7::ZERO)
+                .with_port_number(u7::ZERO)
+                .with_high_bandwidth_pipe_multiplier(u2::new(1))
+                .build(),
+        );
+        let mut qtds = array::from_fn(|i| {
+            Qtd::new(
+                TransferToken::new_active(PidCode::InToken, u15::new(8))
+                    .with_interrupt_on_complete(true),
+                BufferPtrs::new_contiguous(
+                    u64::from(buffer_mem.phys_addr) + 8 * u64::try_from(i).unwrap(),
+                    8,
+                ),
+            )
+        });
+        qh.link_contiguous_qtds(&mut qtds, qtds_mem.phys_addr);
+        qh_ptr.write(qh);
+        qtds_ptr.write(qtds);
+
+        // Assume period of 8ms, so every 8 frames
+        for i in 0..1024 / 8 {
+            self.periodic_list.elements().as_slice().index(i * 8).write(
+                PeriodicFrameListElement::new(SelectType::Qh, qh_mem.phys_addr),
+            );
+        }
+
+        for i in 0..qtds.len() {
+            self.wait_for_qtd(qtds_ptr.as_slice().index(i)).await;
+            let ptr = NonNull::slice_from_raw_parts(
+                NonNull::new((buffer_mem.ptr.addr().get() + i * 8) as *mut u8).unwrap(),
+                8,
+            );
+            let buffer = unsafe { ptr.as_ref() };
+            log::info!("Periodic QTD {i} done! {buffer:02X?}");
+        }
     }
 }
