@@ -2,6 +2,7 @@ use core::{array, future, mem::offset_of, ops::Index, ptr::NonNull, task::Poll};
 
 use alloc::{string::String, sync::Arc, vec::Vec};
 use arbitrary_int::{traits::Integer, u2, u4, u7, u11, u15};
+use embedded_hal_async::delay::DelayNs;
 use volatile::{VolatileFieldAccess, VolatilePtr};
 use zerocopy::{FromBytes, Immutable, KnownLayout, transmute};
 
@@ -19,8 +20,11 @@ use crate::{
     operational_regs::PortScReg,
     periodic_list::{PeriodicFrameListElement, PeriodicFrameListVolatileFieldAccess},
     qh_manager::{QhManager, QhWithMetadata, QhWithMetadataVolatileFieldAccess},
-    qtd::{Qtd, QtdVolatileFieldAccess},
-    queue_head::{AlternateQtdLinkPtr, EndpointCapabilities, EndpointCharacteristics, SelectType},
+    qtd::{NextQtdPointer, Qtd, QtdVolatileFieldAccess},
+    queue_head::{
+        AlternateQtdLinkPtr, CurrentQtdLinkPtr, EndpointCapabilities, EndpointCharacteristics,
+        QueueHeadVolatileFieldAccess, SelectType,
+    },
     root_port_number::RootPortNumber,
     setup_packet::{DescriptorType, SetupPacket},
     transfer_token::{PidCode, TransferToken},
@@ -491,8 +495,9 @@ impl Device {
     pub async fn dev(
         &mut self,
         qh_mem: MappedMem<QueueHead>,
-        qtds_mem: MappedMem<[Qtd; 6]>,
-        buffer_mem: MappedMem<[u8; 8 * 6]>,
+        qtds_mem: MappedMem<[Qtd; 1]>,
+        buffer_mem: MappedMem<[u8; 8 * 1]>,
+        delay: &mut impl DelayNs,
     ) {
         let qh_ptr = unsafe { VolatilePtr::new(qh_mem.ptr) };
         let qtds_ptr = unsafe { VolatilePtr::new(qtds_mem.ptr) };
@@ -526,7 +531,9 @@ impl Device {
                 ),
             )
         });
+        // qtds[2].qtd_token.set_active(false);
         qh.link_contiguous_qtds(&mut qtds, qtds_mem.phys_addr);
+        qtds.last_mut().unwrap().next_qtd_ptr = NextQtdPointer::new_valid(qtds_mem.phys_addr);
         qh_ptr.write(qh);
         qtds_ptr.write(qtds);
 
@@ -537,14 +544,59 @@ impl Device {
             );
         }
 
-        for i in 0..qtds.len() {
-            self.wait_for_qtd(qtds_ptr.as_slice().index(i)).await;
-            let ptr = NonNull::slice_from_raw_parts(
-                NonNull::new((buffer_mem.ptr.addr().get() + i * 8) as *mut u8).unwrap(),
-                8,
-            );
-            let buffer = unsafe { ptr.as_ref() };
-            log::info!("Periodic QTD {i} done! {buffer:02X?}");
+        let mut next_qtd = 0;
+        loop {
+            if !qtds_ptr
+                .as_slice()
+                .index(next_qtd)
+                .qtd_token()
+                .read()
+                .active()
+            {
+                let ptr = NonNull::slice_from_raw_parts(
+                    NonNull::new((buffer_mem.ptr.addr().get() + next_qtd * 8) as *mut u8).unwrap(),
+                    8,
+                );
+                let buffer = unsafe { ptr.as_ref() };
+                let overlay = qh_ptr.transfer_token().read();
+                log::info!("Periodic QTD {next_qtd} done! {buffer:02X?}. Overlay: {overlay:#?}");
+                let qtd_ptr = qtds_ptr.as_slice().index(next_qtd);
+                // Restore current offset
+                qtd_ptr.buffer_pointer_page_0().update(|r| {
+                    r.with_current_offset(
+                        BufferPtrs::new_contiguous(
+                            u64::from(buffer_mem.phys_addr) + 8 * u64::try_from(next_qtd).unwrap(),
+                            8,
+                        )
+                        .offset(),
+                    )
+                });
+                // Restore token
+                qtd_ptr.qtd_token().write(
+                    TransferToken::new_active(PidCode::InToken, u15::new(8))
+                        .with_interrupt_on_complete(true),
+                );
+                next_qtd += 1;
+                if next_qtd == 1 {
+                    next_qtd = 0;
+                }
+            } else {
+                future::poll_fn(|context| {
+                    self.port_wakers[u4::from(self.root_port_number).as_usize()]
+                        .register(context.waker());
+                    if !qtds_ptr
+                        .as_slice()
+                        .index(next_qtd)
+                        .qtd_token()
+                        .read()
+                        .active()
+                    {
+                        return Poll::Ready(());
+                    }
+                    Poll::Pending
+                })
+                .await;
+            }
         }
     }
 }

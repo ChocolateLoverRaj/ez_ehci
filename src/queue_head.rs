@@ -89,12 +89,6 @@ pub struct CurrentQtdLinkPtr {
     ptr_upper: u27,
 }
 
-impl CurrentQtdLinkPtr {
-    pub fn new(ptr: u32) -> Self {
-        Self::new_with_raw_value(0).with_ptr_upper(u27::new(ptr >> 5))
-    }
-}
-
 #[bitfield(u32, debug)]
 pub struct AlternateQtdLinkPtr {
     #[bit(0, rw)]
