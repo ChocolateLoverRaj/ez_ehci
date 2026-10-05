@@ -1,5 +1,5 @@
 use alloc::{boxed::Box, sync::Arc};
-use arbitrary_int::u4;
+use arbitrary_int::{u4, u5};
 use futures::task::AtomicWaker;
 use volatile::VolatilePtr;
 
@@ -9,6 +9,9 @@ use crate::{
     qh_manager::QhManager,
 };
 
+/// This can be configured within 0..=31, since max 31 endpoints at a time which we might want to execute 1 future for each endpoint in parallel.
+pub const WAKERS_PER_PORT: u5 = u5::new(31);
+/// WAKERS_PER_PORT for port 0, WAKERS_PER_PORT for port 1, etc, for each port that exists on the eHCI.
 pub type UsbIntWakers = Arc<[AtomicWaker]>;
 
 /// Unlike xHCI, which has advanced interrupt handling with the ability to load balance between CPUs, the eHCI has a single PCI IRQ line (no MSI). This interrupt handler notifies async functions that are waiting for interrupts.
