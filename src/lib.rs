@@ -10,6 +10,7 @@ mod device_descriptor;
 mod device_greeter;
 mod endpoint_descriptor;
 mod endpoint_speed;
+mod hub_descriptor;
 mod initialized_ehci;
 mod interface_descriptor;
 mod irq_handler;
@@ -47,7 +48,7 @@ pub use crate::{
 };
 
 #[derive(Debug, Clone, Copy)]
-pub struct MappedMem<T> {
+pub struct MappedMem<T: ?Sized> {
     pub phys_addr: u32,
     pub ptr: NonNull<T>,
 }

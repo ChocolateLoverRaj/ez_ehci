@@ -71,6 +71,21 @@ impl SetupPacket {
             w_length: 0_u16.to_le_bytes(),
         }
     }
+
+    pub fn new_get_hub_descriptor(w_length: u16) -> Self {
+        Self {
+            bm_request_type: BmRequestType::builder()
+                .with_recipient(Recipient::Device.into())
+                .with_request_type(RequestType::Class.into())
+                .with_direction(Direction::DeviceToHost.into())
+                .build()
+                .raw_value(),
+            b_request: BRequest::GetDescriptor.into(),
+            w_value: [0, HubDescriptorType::Hub.into()],
+            w_index: 0_u16.to_le_bytes(),
+            w_length: w_length.to_le_bytes(),
+        }
+    }
 }
 
 #[bitfield(u8, debug)]
@@ -147,4 +162,10 @@ pub enum DescriptorType {
     DeviceQualifier = 6,
     OtherSpeedConfiguration = 7,
     InterfacePower = 8,
+}
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, IntoPrimitive, TryFromPrimitive)]
+pub enum HubDescriptorType {
+    Hub = 0x29,
 }

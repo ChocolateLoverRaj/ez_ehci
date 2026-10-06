@@ -15,6 +15,7 @@ use crate::{
         EndpointAddress, EndpointAttributes, EndpointDescriptor, EndpointMaxPacketSize,
     },
     endpoint_speed::EndpointSpeed,
+    hub_descriptor::HubDescriptor,
     interface_descriptor::InterfaceDescriptor,
     irq_handler::UsbIntWakers,
     operational_regs::PortScReg,
@@ -39,18 +40,18 @@ pub struct UsbVersion {
 
 #[derive(Debug, Clone)]
 pub struct DeviceInfo {
-    usb_version: UsbVersion,
-    device_class: u8,
-    device_sub_class: u8,
-    device_protocol: u8,
-    max_packet_size: u8,
-    vendor_id: u16,
-    product_id: u16,
-    bcd_device: u16,
-    manufacturer: Option<String>,
-    product: Option<String>,
-    serial_number: Option<String>,
-    configurations: Vec<Configuration>,
+    pub usb_version: UsbVersion,
+    pub device_class: u8,
+    pub device_sub_class: u8,
+    pub device_protocol: u8,
+    pub max_packet_size: u8,
+    pub vendor_id: u16,
+    pub product_id: u16,
+    pub bcd_device: u16,
+    pub manufacturer: Option<String>,
+    pub product: Option<String>,
+    pub serial_number: Option<String>,
+    pub configurations: Vec<Configuration>,
 }
 
 #[derive(Debug, Clone)]
@@ -125,91 +126,16 @@ impl Device {
         .await;
     }
 
-    async fn get_device_descriptor(
-        &mut self,
-        qh_mem: MappedMem<QhWithMetadata>,
-        qtds_mem: MappedMem<[Qtd; 3]>,
-        setup_packet_buffer_mem: MappedMem<[u8; 8]>,
-        descriptor_buffer_mem: MappedMem<[u8; 18]>,
-    ) -> DeviceDescriptor {
-        let qh_ptr = unsafe { VolatilePtr::new(qh_mem.ptr) };
-        let qtds_ptr = unsafe { VolatilePtr::new(qtds_mem.ptr) };
-        let setup_packet_buffer_ptr = unsafe { VolatilePtr::new(setup_packet_buffer_mem.ptr) };
-        let descriptor_buffer_ptr = unsafe { VolatilePtr::new(descriptor_buffer_mem.ptr) };
-        // Get the device descriptor.
-        let mut qtds = [
-            Qtd::new(
-                TransferToken::new_active(PidCode::SetupToken, u15::new(8))
-                    .with_interrupt_on_complete(true),
-                BufferPtrs::new_contiguous(setup_packet_buffer_mem.phys_addr.into(), 8),
-            ),
-            Qtd::new(
-                TransferToken::new_active(PidCode::InToken, u15::new(18))
-                    .with_data_toggle(true)
-                    .with_interrupt_on_complete(true),
-                BufferPtrs::new_contiguous(descriptor_buffer_mem.phys_addr.into(), 18),
-            ),
-            Qtd::new(
-                TransferToken::new_active(PidCode::OutToken, u15::ZERO)
-                    .with_data_toggle(true)
-                    .with_interrupt_on_complete(true),
-                BufferPtrs::ZERO,
-            ),
-        ];
-        let mut qh = QueueHead::new(
-            EndpointCharacteristics::new_with_raw_value(0)
-                .with_head_of_reclamation_list_flag(false)
-                .with_device_addr(self.addr)
-                .with_endpoint_number({
-                    // control endpoint
-                    u4::ZERO
-                })
-                .with_endpoint_speed(EndpointSpeed::High.into())
-                .with_max_packet_len(u11::new({
-                    // We know the device is USB 2.0, so min max packet len is 64
-                    // We can use >64 after we read the device descriptor
-                    64
-                })),
-            EndpointCapabilities::ZERO,
-        );
-        qh.link_contiguous_qtds(&mut qtds, qtds_mem.phys_addr);
-        qtds_ptr.write(qtds);
-        qh_ptr.qh().write(qh);
-        setup_packet_buffer_ptr.write(transmute!(SetupPacket::new_get_device_descriptor(18)));
-        self.qh_manager.add_qh_to_async_list(qh_mem);
-        self.wait_for_qtd(qtds_ptr.as_slice().index(0)).await;
-        self.wait_for_qtd(qtds_ptr.as_slice().index(1)).await;
-        self.wait_for_qtd(qtds_ptr.as_slice().index(2)).await;
-        self.qh_manager
-            .remove_qh(qh_mem, self.root_port_number.into())
-            .await;
-
-        let bytes_to_transfer = qtds_ptr
-            .as_slice()
-            .index(1)
-            .qtd_token()
-            .read()
-            .total_bytes_to_transfer();
-        let bytes_transferred = u15::new(18) - bytes_to_transfer;
-        let descriptor_buffer = descriptor_buffer_ptr.read();
-        let descriptor_bytes =
-            &descriptor_buffer[..usize::try_from(bytes_transferred.value()).unwrap()];
-        let device_descriptor = DeviceDescriptor::ref_from_bytes(descriptor_bytes).unwrap();
-        *device_descriptor
-    }
-
     /// Returns the size of the configuration descriptor, which is stored in the buffer.
-    async fn get_configuration_descriptor(
+    async fn get_descriptor(
         &mut self,
-        descriptor_num: u8,
         qh_mem: MappedMem<QhWithMetadata>,
         qtds_mem: MappedMem<[Qtd; 3]>,
         setup_packet_mem: MappedMem<[u8; 8]>,
-        buffer_mem: MappedMem<[u8; MAX_CONFIGURATION_DESCRIPTOR_LEN]>,
+        buffer_mem: MappedMem<[u8]>,
     ) -> usize {
         let qh_ptr = unsafe { VolatilePtr::new(qh_mem.ptr) };
         let qtds_ptr = unsafe { VolatilePtr::new(qtds_mem.ptr) };
-        let setup_packet_ptr = unsafe { VolatilePtr::new(setup_packet_mem.ptr) };
 
         let mut qh = QueueHead::new(
             EndpointCharacteristics::new_with_raw_value(0)
@@ -229,6 +155,7 @@ impl Device {
         );
         let status_qtd_phys_addr =
             qtds_mem.phys_addr + u32::try_from(size_of::<Qtd>()).unwrap() * 2;
+        let in_bytes_to_transfer = u15::new(buffer_mem.ptr.len().try_into().unwrap());
         let mut qtds = [
             // SETUP
             Qtd::new(
@@ -238,15 +165,12 @@ impl Device {
             // IN
             {
                 let mut qtd = Qtd::new(
-                    TransferToken::new_active(
-                        PidCode::InToken,
-                        u15::new(MAX_CONFIGURATION_DESCRIPTOR_LEN.try_into().unwrap()),
-                    )
-                    .with_data_toggle(false)
-                    .with_interrupt_on_complete(true),
+                    TransferToken::new_active(PidCode::InToken, in_bytes_to_transfer)
+                        .with_data_toggle(false)
+                        .with_interrupt_on_complete(true),
                     BufferPtrs::new_contiguous(
                         u64::from(buffer_mem.phys_addr),
-                        MAX_CONFIGURATION_DESCRIPTOR_LEN.try_into().unwrap(),
+                        buffer_mem.ptr.len().try_into().unwrap(),
                     ),
                 );
                 qtd.alternate_next_qtd_ptr = AlternateQtdLinkPtr::new(status_qtd_phys_addr);
@@ -260,23 +184,18 @@ impl Device {
                 BufferPtrs::ZERO,
             ),
         ];
-        setup_packet_ptr.write(transmute!(SetupPacket::new_get_configuration_descriptor(
-            MAX_CONFIGURATION_DESCRIPTOR_LEN.try_into().unwrap(),
-            descriptor_num
-        )));
         qh.link_contiguous_qtds(&mut qtds, qtds_mem.phys_addr);
         qh_ptr.qh().write(qh);
         qtds_ptr.write(qtds);
 
         self.qh_manager.add_qh_to_async_list(qh_mem);
         self.wait_for_qtd(qtds_ptr.as_slice().index(1)).await;
-        log::info!("QTD 1 complete");
         self.wait_for_qtd(qtds_ptr.as_slice().index(2)).await;
         self.qh_manager
             .remove_qh(qh_mem, self.root_port_number.into())
             .await;
 
-        let descriptor_len = u15::new(MAX_CONFIGURATION_DESCRIPTOR_LEN.try_into().unwrap())
+        let descriptor_len = in_bytes_to_transfer
             - qtds_ptr
                 .as_slice()
                 .index(1)
@@ -284,6 +203,66 @@ impl Device {
                 .read()
                 .total_bytes_to_transfer();
         descriptor_len.as_usize()
+    }
+
+    async fn get_device_descriptor(
+        &mut self,
+        qh_mem: MappedMem<QhWithMetadata>,
+        qtds_mem: MappedMem<[Qtd; 3]>,
+        setup_packet_mem: MappedMem<[u8; 8]>,
+        buffer_mem: MappedMem<[u8; 18]>,
+    ) -> DeviceDescriptor {
+        let setup_packet_buffer_ptr = unsafe { VolatilePtr::new(setup_packet_mem.ptr) };
+        setup_packet_buffer_ptr.write(transmute!(SetupPacket::new_get_device_descriptor(18)));
+        let buffer_ptr = unsafe { VolatilePtr::new(buffer_mem.ptr) };
+        let bytes_transferred = self
+            .get_descriptor(
+                qh_mem,
+                qtds_mem,
+                setup_packet_mem,
+                MappedMem {
+                    phys_addr: buffer_mem.phys_addr,
+                    ptr: NonNull::slice_from_raw_parts(buffer_mem.ptr.cast(), 18),
+                },
+            )
+            .await;
+        let descriptor_bytes = unsafe {
+            buffer_ptr
+                .as_slice()
+                .index(..usize::try_from(bytes_transferred).unwrap())
+                .as_raw_ptr()
+                .as_ref()
+        };
+        DeviceDescriptor::read_from_bytes(descriptor_bytes).unwrap()
+    }
+
+    /// Returns the size of the configuration descriptor, which is stored in the buffer.
+    async fn get_configuration_descriptor(
+        &mut self,
+        descriptor_num: u8,
+        qh_mem: MappedMem<QhWithMetadata>,
+        qtds_mem: MappedMem<[Qtd; 3]>,
+        setup_packet_mem: MappedMem<[u8; 8]>,
+        buffer_mem: MappedMem<[u8; MAX_CONFIGURATION_DESCRIPTOR_LEN]>,
+    ) -> usize {
+        let setup_packet_ptr = unsafe { VolatilePtr::new(setup_packet_mem.ptr) };
+        setup_packet_ptr.write(transmute!(SetupPacket::new_get_configuration_descriptor(
+            MAX_CONFIGURATION_DESCRIPTOR_LEN.try_into().unwrap(),
+            descriptor_num
+        )));
+        self.get_descriptor(
+            qh_mem,
+            qtds_mem,
+            setup_packet_mem,
+            MappedMem {
+                phys_addr: buffer_mem.phys_addr,
+                ptr: NonNull::slice_from_raw_parts(
+                    buffer_mem.ptr.cast(),
+                    MAX_CONFIGURATION_DESCRIPTOR_LEN,
+                ),
+            },
+        )
+        .await
     }
 
     pub async fn get_device_info(&mut self, buffer: MappedMem<GetInfoBuffer>) -> DeviceInfo {
@@ -598,5 +577,39 @@ impl Device {
                 .await;
             }
         }
+    }
+
+    pub async fn hub_info(
+        &mut self,
+        qh_mem: MappedMem<QhWithMetadata>,
+        qtds_mem: MappedMem<[Qtd; 3]>,
+        setup_packet_mem: MappedMem<[u8; 8]>,
+        buffer_mem: MappedMem<[u8; size_of::<HubDescriptor>()]>,
+    ) {
+        log::info!("Getting hub info");
+        let setup_packet_ptr = unsafe { VolatilePtr::new(setup_packet_mem.ptr) };
+        setup_packet_ptr.write(transmute!(SetupPacket::new_get_hub_descriptor(
+            size_of::<HubDescriptor>().try_into().unwrap()
+        )));
+        let descriptor_len = self
+            .get_descriptor(
+                qh_mem,
+                qtds_mem,
+                setup_packet_mem,
+                MappedMem {
+                    phys_addr: buffer_mem.phys_addr,
+                    ptr: NonNull::slice_from_raw_parts(
+                        buffer_mem.ptr.cast(),
+                        size_of::<HubDescriptor>(),
+                    ),
+                },
+            )
+            .await;
+        let descriptor_ptr =
+            NonNull::slice_from_raw_parts(buffer_mem.ptr.cast::<u8>(), descriptor_len);
+        let descriptor = unsafe { descriptor_ptr.as_ref() };
+        log::info!("Descriptor bytes: {descriptor:02X?}");
+        let hub_descriptor = HubDescriptor::from_bytes(descriptor);
+        log::info!("{hub_descriptor:#?}");
     }
 }
