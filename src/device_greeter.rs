@@ -208,7 +208,7 @@ impl DeviceGreeterWaitingForDevice {
         log::trace!("QTD 1 complete");
 
         // Remove the QH so we can reuse the buffer
-        self.qh_manager.remove_qh(qh_mapped_mem, self.n_ports).await;
+        self.qh_manager.remove_qh(qh_mapped_mem).await;
 
         Device {
             root_port_number: port.try_into().unwrap(),

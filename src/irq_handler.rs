@@ -61,9 +61,9 @@ impl IrqHandler {
                 waker.wake();
             }
         }
+        let mut call_handle_async_advance = false;
         if status.interrupt_on_async_advance() {
-            log::trace!("INTERRUPT ON ASYNC ADVANCE!");
-            self.qh_manager.handle_async_advance();
+            call_handle_async_advance = true;
             clear.set_interrupt_on_async_advance(true);
         }
         if status.port_change_detect() {
@@ -79,6 +79,9 @@ impl IrqHandler {
             }
         }
         self.operational_regs.usb_sts().write(clear);
+        if call_handle_async_advance {
+            self.qh_manager.handle_async_advance();
+        }
 
         for port in 0..self.n_ports.value() {
             let port_sc_reg_ptr = self.port_sc_regs.index(usize::try_from(port).unwrap());

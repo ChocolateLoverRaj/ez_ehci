@@ -191,9 +191,7 @@ impl Device {
         self.qh_manager.add_qh_to_async_list(qh_mem);
         self.wait_for_qtd(qtds_ptr.as_slice().index(1)).await;
         self.wait_for_qtd(qtds_ptr.as_slice().index(2)).await;
-        self.qh_manager
-            .remove_qh(qh_mem, self.root_port_number.into())
-            .await;
+        self.qh_manager.remove_qh(qh_mem).await;
 
         let descriptor_len = in_bytes_to_transfer
             - qtds_ptr
@@ -451,9 +449,7 @@ impl Device {
         qtds_ptr.write(qtds);
         self.qh_manager.add_qh_to_async_list(qh_mem);
         self.wait_for_qtd(qtds_ptr.as_slice().index(1)).await;
-        self.qh_manager
-            .remove_qh(qh_mem, self.root_port_number.into())
-            .await;
+        self.qh_manager.remove_qh(qh_mem).await;
     }
 
     pub async fn set_configuration(
@@ -624,7 +620,6 @@ impl Device {
         )
         .await;
         log::info!("set HUB configuration to 1");
-        // delay.delay_ms(50).await;
 
         for port_number in 1..=hub_descriptor.fixed_size_fields.b_nbr_ports {
             // Enable power for all ports
@@ -640,21 +635,6 @@ impl Device {
                 setup_packet_mem,
             )
             .await;
-            log::info!("enabled port power for port {port_number}");
-
-            // log::info!("setting HUB configuration to 1 as a test - {port_number}");
-            // self.set_configuration(
-            //     1,
-            //     qh_mem,
-            //     MappedMem {
-            //         phys_addr: qtds_mem.phys_addr,
-            //         ptr: qtds_mem.ptr.cast(),
-            //     },
-            //     setup_packet_mem,
-            // )
-            // .await;
-            // log::info!("set HUB configuration to 1 as a test - {port_number}");
-            // delay.delay_ms(100).await;
         }
     }
 }

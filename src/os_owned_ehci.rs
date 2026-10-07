@@ -173,7 +173,7 @@ impl OsOwnedEhci {
         let port_sc_regs = self.port_sc_regs;
         let port_wakers: UsbIntWakers = (0..n_ports.value()).map(|_| AtomicWaker::new()).collect();
         let operational_regs = self.operational_regs;
-        let qh_manager = Arc::new(QhManager::new(anchor_qh_mem, n_ports, operational_regs));
+        let qh_manager = Arc::new(QhManager::new(anchor_qh_mem, operational_regs));
 
         EhciParts {
             device_greeter: DeviceGreeterWaitingForDevice::new(
