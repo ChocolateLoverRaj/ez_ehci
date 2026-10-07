@@ -5,7 +5,11 @@ use core::{
     task::Poll,
 };
 
-use alloc::{sync::Arc, task::Wake, vec::Vec};
+use alloc::{
+    sync::{Arc, Weak},
+    task::Wake,
+    vec::Vec,
+};
 use futures::task::AtomicWaker;
 use spinning_top::Spinlock;
 use volatile::{VolatileFieldAccess, VolatilePtr};
@@ -30,7 +34,7 @@ enum SlotState {
 #[derive(Debug)]
 struct Slot {
     state: SlotState,
-    wakers: Vec<Arc<OneshotWaker>>,
+    wakers: Vec<Weak<OneshotWaker>>,
 }
 
 impl Default for Slot {
@@ -186,7 +190,7 @@ impl QhManager {
                                     _ => unreachable!(),
                                 };
                                 slots[slot_to_queue].state = SlotState::Active;
-                                slots[slot_to_queue].wakers.push(waker.clone());
+                                slots[slot_to_queue].wakers.push(Arc::downgrade(&waker));
                                 slot_to_queue
                             };
                             self.active_slot.store(slot_to_queue, Ordering::Release);
@@ -204,7 +208,7 @@ impl QhManager {
                                 slot.wakers.clear()
                             }
                             assert_eq!(slot.state, SlotState::Queued);
-                            slot.wakers.push(waker.clone());
+                            slot.wakers.push(Arc::downgrade(&waker));
                             // Release the lock, but only if the other slot is locked
                             loop {
                                 if self
@@ -278,8 +282,10 @@ impl QhManager {
         }
         let active_slot = unsafe { self.slots[active_slot_index].get().as_mut_unchecked() };
         for waker in &active_slot.wakers {
-            waker.woken.store(true, Ordering::Relaxed);
-            waker.waker.wake();
+            if let Some(waker) = waker.upgrade() {
+                waker.woken.store(true, Ordering::Relaxed);
+                waker.waker.wake();
+            }
         }
         // Don't deallocate, just mark as garbage
         active_slot.state = SlotState::Garbage;
