@@ -86,6 +86,21 @@ impl SetupPacket {
             w_length: w_length.to_le_bytes(),
         }
     }
+
+    pub fn new_set_feature_port_power(port_number: u8) -> Self {
+        Self {
+            bm_request_type: BmRequestType::builder()
+                .with_recipient(Recipient::Other.into())
+                .with_request_type(RequestType::Class.into())
+                .with_direction(Direction::HostToDeviceOrNoDataTransfer.into())
+                .build()
+                .raw_value(),
+            b_request: BRequest::SetFeature.into(),
+            w_value: u16::from(HubFeature::PortPower).to_le_bytes(),
+            w_index: u16::from(port_number).to_le_bytes(),
+            w_length: 0_u16.to_le_bytes(),
+        }
+    }
 }
 
 #[bitfield(u8, debug)]
@@ -168,4 +183,10 @@ pub enum DescriptorType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, IntoPrimitive, TryFromPrimitive)]
 pub enum HubDescriptorType {
     Hub = 0x29,
+}
+
+#[repr(u16)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, IntoPrimitive, TryFromPrimitive)]
+pub enum HubFeature {
+    PortPower = 0x8,
 }

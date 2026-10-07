@@ -538,7 +538,7 @@ impl Device {
                 );
                 let buffer = unsafe { ptr.as_ref() };
                 let overlay = qh_ptr.transfer_token().read();
-                log::info!("Periodic QTD {next_qtd} done! {buffer:02X?}. Overlay: {overlay:#?}");
+                log::info!("Periodic QTD {next_qtd} done! {buffer:02X?}");
                 let qtd_ptr = qtds_ptr.as_slice().index(next_qtd);
                 // Restore current offset
                 qtd_ptr.buffer_pointer_page_0().update(|r| {
@@ -585,6 +585,7 @@ impl Device {
         qtds_mem: MappedMem<[Qtd; 3]>,
         setup_packet_mem: MappedMem<[u8; 8]>,
         buffer_mem: MappedMem<[u8; size_of::<HubDescriptor>()]>,
+        delay: &mut impl DelayNs,
     ) {
         log::info!("Getting hub info");
         let setup_packet_ptr = unsafe { VolatilePtr::new(setup_packet_mem.ptr) };
@@ -611,5 +612,49 @@ impl Device {
         log::info!("Descriptor bytes: {descriptor:02X?}");
         let hub_descriptor = HubDescriptor::from_bytes(descriptor);
         log::info!("{hub_descriptor:#?}");
+
+        self.set_configuration(
+            1,
+            qh_mem,
+            MappedMem {
+                phys_addr: qtds_mem.phys_addr,
+                ptr: qtds_mem.ptr.cast(),
+            },
+            setup_packet_mem,
+        )
+        .await;
+        log::info!("set HUB configuration to 1");
+        // delay.delay_ms(50).await;
+
+        for port_number in 1..=hub_descriptor.fixed_size_fields.b_nbr_ports {
+            // Enable power for all ports
+            setup_packet_ptr.write(transmute!(SetupPacket::new_set_feature_port_power(
+                port_number
+            )));
+            self.do_setup_transfer(
+                qh_mem,
+                MappedMem {
+                    phys_addr: qtds_mem.phys_addr,
+                    ptr: qtds_mem.ptr.cast(),
+                },
+                setup_packet_mem,
+            )
+            .await;
+            log::info!("enabled port power for port {port_number}");
+
+            // log::info!("setting HUB configuration to 1 as a test - {port_number}");
+            // self.set_configuration(
+            //     1,
+            //     qh_mem,
+            //     MappedMem {
+            //         phys_addr: qtds_mem.phys_addr,
+            //         ptr: qtds_mem.ptr.cast(),
+            //     },
+            //     setup_packet_mem,
+            // )
+            // .await;
+            // log::info!("set HUB configuration to 1 as a test - {port_number}");
+            // delay.delay_ms(100).await;
+        }
     }
 }
