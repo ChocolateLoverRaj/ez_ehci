@@ -134,3 +134,153 @@ Within the QH you can actually make a circular linked list of QTDs, like a ring 
 
 ### Frame list size
 Depending on the eHCI, there are either 1024 slots (meaning that it takes 1024 ms to go through the entire list), or, if supported, you can choose if you want 1024, 512, or 256 slots. Choosing 256 slots as the size is really for computers where 3 KiB of RAM usage (how much you save by selecting 256 slots) savings matters. You are probably not in such as resource-constrained environment. So just don't care if smaller frame list sizes are supported, and stick to 1024, which will always be supported.
+
+# Design Choices
+## Things to consider
+- I am new to writing drivers. I started writing an xHCI driver based on [Stellux OS's Tutorial](https://www.youtube.com/watch?v=W0EqQiDSoxE)
+- My "OS" is currently a kernel with a single thread which runs on a single core, with an async executor
+- I want to first learn about USB and how to get eHCI working before focusing on performance and integrating it into a "real" OS
+- Compatibility with non-Rust programming languages is not a goal
+- Code that would use this library is probably
+  - A unikernel
+  - Written in Rust
+  - Uses async itself already
+  - Has enough memory
+  - Doesn't care much about performance (ok to allocate frequently and allocate way more than necessary)
+
+## Why async?
+- Interrupt based, and async can work pretty decently in unikernels when you need to wait until there is an interrupt.
+- Lets you write unikernels with a big async function without thinking about things too much, and focus on the fun.
+- Async code can feel really natural
+
+## Interrupts and allocations
+- The IRQ handler
+  - Interrupts assumed to be disabled (it is extremely normal for interrupt handlers to always run with interrupts disabled)
+  - Can allocate? Maybe, depends on the OS. Many Rust hobby unikernels have a global allocator based on a spin lock. If the IRQ handler preempts something that was holding the lock, then it would cause a deadlock if the IRQ handler tried to allocate. So if our IRQ handler did allocate, then we would have to have special instructions for the OS to make sure allocations are possible when calling our IRQ handler. This would most likely involve making the allocator always disable interrupts before acquiring the lock. I want to avoid making operating systems do this, since it shifts this extra complexity on the OS.
+  - Can run on multiple cores? Practically, what is the point of this? eHCI doesn't support MSI and fancy interrupt routing like xHCI does. It routes to a I/O APIC irq, which routes to a LAPIC. We should make the IRQ handler be able to be called from *any* core, but require the OS to not have simultaneous calls to the IRQ handler (that wouldn't even make sense).
+- Regular fns
+  - Run with interrupts enabled? Depends on the OS. If we require interrupts to be disabled while calling our functions and calling `poll` on our futures, that might make things easier for locks used by normal fns and the IRQ handler.  However, this adds an extra restriction to the OS.
+  - Can allocate? Yes. This is not unreasonable to ask the OS developer. Using `alloc` is very common and we will use it heavily. We will `Arc` without thinking "Hmm can this be an `T<'a>`?" and things turning into `struct MyStruct<'a, 'b, 'c>`. So yes, we will require allocations to be possible.
+  - Can run on multiple cores? Yes, I think many unikernels will implement SMP and utilize multiple cores and move futures around. We should make sure that all of our structs are `Send` and `Sync` and support concurrency. It should also run just fine on a single-core system.
+
+## Challenge: forwarding interrupts to multiple wakers
+One of the most important and highly needed eHCI interrupt is the "USB interrupt", which will fire when any transfer is complete. On a busy system that's doing multiple USB things, it will constantly be getting eHCI interrupts. eHCI doesn't tell us *which* QTD was complete, so the only way to know is by reading the QTDs.
+
+### Minimal Interrupt Sources
+- Laptop with eHCI + companion controller, no USB devices plugged in
+- Nothing would cause USB Interrupts, only port change interrupt on device plug
+- Only a single "subscriber" to the port change interrupt
+
+### Realistic Example
+- You have an OS with 1-2 HID devices (for example, keyboard + mouse or gamepad) running on a laptop with Integrated Rate Matching Hubs
+- Root port status change interrupt
+- 1 periodic endpoint for hub events
+- 1 periodic endpoint for one HID device
+- 1 periodic endpoint for the second HID device, if it's connected
+
+### More complex but still realistic example
+- eHCI root hub
+  - port status change int
+- Integrated Rate Matching Hub
+  - interrupt endpoint
+- 2 physical
+  - 2 interrupt endpoints
+- keyboard, mouse, and 4 gamepads
+  - 6 interrupt endpoints
+- 1 mic and 1 speaker
+  - 2 isochronous endpoints
+
+### Theoretical max
+127 devices, each with 32 endpoints, with a total of 4064 endpoints!
+
+### What makes it challenging
+Because our library is async, the pattern is that we have 2 main parts to our API:
+- Fun stuff (actually interact with hubs, devices, and endpoints)
+- IRQ handler (required, of course, since this is an interrupt and not polling based driver)
+
+The fun stuff returns futures which will get a waker, and then will need to store that waker somewhere. Then the IRQ handler will wake the waker so that the OS's async executor will poll the futures which could've became ready because of the IRQ.
+
+We will have >1 waker associated with an IRQ, especially the USB int IRQ. We might even have hundreds of wakers! So, in our IRQ handler do we call every waker? And how do we store an unbounded number of wakers? What data structure do we use and how does it affect allocations?
+
+### Possible Solution: waker list where IRQ handler never has to deal with contention
+The list can be an atmoic `Option<Box<Collection<T>>>` where `Collection` can be a `Vec`, `BTreeMap`, etc. The IRQ handler can just atomic swap it to `None`, indicating that it is locked by the IRQ handler. It can then call all of the wakers. The waker must not allocate or deallocate (not that hard to meet this requirement). Then the IRQ handler can just atomic store it again. This way the IRQ handler doesn't have to deallocate wakers. That can be implemented in the `Drop` trait of the future that added the waker in the first place. 
+
+For futures, there will be a separate Mutex they have to go through to add/remove wakers from the list. We could just make this a spin mutex. They will only need to spin in a multi-core system, so this shouldn't cause issues with most OSs using this library. We could also use `lock_api` to let multi-core operating systems use an IPI based mutex. Once they acquire the lock, they have to unsafely get an `&Box`, copy it to make a new `Box`, then compare and exchange the old box with the new box atomically. This way, the IRQ handler can get an `&Box` at any time. If the IRQ handler swaps it to a `None`, then the compare and exchange will fail, and the future will have to spin until the IRQ handler releases the box again. This makes sure that when the IRQ handler swaps back the `Box`, it will always get back a `None` and not a `Box`. 
+
+This can be called `RoyalMutex`. The IRQ handler is "royal" and never has to wait. Everything else will wait for it. Everything else has to share with each other (could be backed by an unfair mutex or a fair mutex) and always has less priority than the IRQ handler. Only 1 thread can be "royal" at a time. This can be enforced by a runtime panic if a `royal_lock` swaps with `None` and then receives a `None`. 
+
+### Another possible solution: the IRQ handler doesn't actually need to obtain the mutex
+There is nothing special about the IRQ handler. It's just a signal from the eHCI, "there is new data to be processed". The IRQ handler just needs to make sure that the data is processed, which is simply reading USBSTS and then processing any updates based on its value. The eHCI handler can attempt to acquire the lock to global data. We can call this global data lock. If it doesn't acquire the lock, it will leave a flag for whatever releases the lock to first process any updates. The IRQ handler can say "you're holding the lock? that's fine, just do my work for me before you release it. i'm going to return.". This way, we don't actually need a royal mutex. We can just have an `AtomicBool` which is an indicator than an IRQ occurred, along with a regular mutex (spin or generic). Other futures will still have to acquire the mutex because they need to insert/remove wakers (again, there will only be contention if )
+
+## Support sync Rust mode?
+Use case: maybe you're kernel logger is going to log through a USB to UART adapter. Enabling interrupt while logging messages adds complexity and can make things hard to debug. We could still keep this library sync while making sure it works in a spin loop async executor.
+
+But then, what about the IRQ handler? If interrupt are disabled, our IRQ handler won't be called during this synchronous execution. Is this OK? This means that we can't rely on the interrupt handler doing core logic. The interrupt handler's job will basically be to wake a waker on an interrupt. But this means that other structs which there can be multiple copies of might try to access common registers such as USBCMD and USBSTS concurrently (if there are multiple cores). 
+
+USBSTS should be fine. Everything can be done atomically. You can read the u32. The only writes are to clear bits, and simultaneous writes won't interfere with each other. 
+
+USBCMD has a bunch of RW fields. Updating a single fields requires a read-modify-write. So we need to make sure that only 1 piece of code has an `&mut` to USBCMD.
+
+One way we can solve this is by having a driver future. The driver future will own `&mut` USBCMD (and other configuration related things). This will make other futures depend on the driver future being polled for them to work properly.
+
+What if an OS does this:
+- async executor
+- join
+  - driver future
+  - async fn 
+    - log::info!()
+    - logger
+    - need to log to the USB to UART device somehow. we can't just spin poll the fns on the USB device struct because that would starve the driver future, causing nothing to happen.
+
+What if instead every single async fn *could* drive itself? Then this library could support sync loggers which temporarily spin loop poll certain USB operations. This would mean:
+- Every async function has to check USBSTS and possibly modify USBCMD every time it is polled.
+- We would need to put USBCMD and more in a Mutex or RwLock. In a single-core system with 1 thread, there would never be any contention on the lock. In a multi-core system with 1 thread per core, there might be contention but there won't be a deadlock.
+- We have to be careful to not attempt to acquire the lock in the interrupt handler since that might deadlock if `poll` is called with interrupts enabled.
+- We can make interrupt handler take an `&self` instead of `&mut self` because things would be behind locks anyways.
+
+## What does a without interrupts async executor look like?
+```rs
+pub fn execute_future<F: Future>(future: F) -> F::Output {
+    let mut pinned = pin!(future);
+    let waker = Waker::from(noop);
+    let mut cx = Context::from_waker(&waker);
+    loop {
+        match pinned.poll_unpin(&mut cx) {
+            Poll::Ready(output) => break output,
+            Poll::Pending => {}
+        }
+    }
+}
+```
+`execute_future` can be problematic if called inside an async function.
+
+## What does a single-core async executor look like?
+- disable interrupts
+- poll with a noop waker
+- if ready, done!
+- if pending, enable and hlt, and then poll again
+
+## What does a multi-core async executor look like?
+Idk how many unikernels are going to have a multi-core executor while still only having 1 thread per CPU. Maybe once you have the complexity of 4 kernel threads you might add things like multiple kernel threads on 1 CPU, preemption, maybe user mode? I don't see much of a point to this since a big reason why a simple rust kernel will have an async executor is to run everything on one core and not deal with multiple threads. Async fns should be targeting 0% CPU usage anyways. Realistically 0.1-10% is the target. There isn't much benfit to splitting 10% of a CPU of work into 4 different CPUs.
+
+- waker that sends an IPI to all other cores (this way, the waker can be sent across cores and it can still wake whatever future needs to be woken even if that future is on a different core)
+- disable interrupts
+- poll with the waker
+- if ready, done (exit loop)
+- if pending, enable and hlt (IRQs processed on other cores that call wakers will wake up this core from hlt), and then poll again.
+
+## Use case: synchronous loggers
+- Log to a USB to UART device
+- Do it synchronously
+- Call logger from inside an async fn
+- Handle disconnects and reconnects of the USB to UART device in the middle of a log?
+
+## Struct heirarchy
+Goals:
+- Use `'static` lifetimes so that everything can be sent around and stored freely
+- Ok to use runtime borrow checking and heavy use of `Arc`
+
+- NewDeviceStream struct for getting new devices?
+- Hub struct for manual control over hubs?
+- Device (can have different stages of initialization each have their own type). A device will have a configuration set. This driver will remember the configurations.
+- Interface that owns

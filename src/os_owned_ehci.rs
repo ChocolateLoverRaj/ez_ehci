@@ -9,6 +9,7 @@ use crate::{
     InitializedEhci, MappedMem, PeriodicFrameList,
     capability_regs::{CapabilityRegs, CapabilityRegsVolatileFieldAccess},
     device_greeter::{AssignAddrBuffer, DeviceGreeterWaitingForDevice, PortChangeDetectWaker},
+    ehci_runner::EhciRunner,
     irq_handler::{IrqHandler, UsbIntWakers},
     operational_regs::{
         AsyncListAddrReg, OperationalRegs, OperationalRegsVolatileFieldAccess, PortScReg, UsbStsReg,
@@ -73,7 +74,7 @@ impl OsOwnedEhci {
         periodic_frame_list_mem: MappedMem<PeriodicFrameList>,
         anchor_qh_mem: MappedMem<QhWithMetadata>,
         greeter_buffer: MappedMem<AssignAddrBuffer>,
-    ) -> EhciParts {
+    ) -> EhciRunner {
         // Halt
         log::info!("Halting eHCI");
         self.operational_regs

@@ -1,13 +1,18 @@
 #![no_std]
+#![feature(vec_push_within_capacity)]
 extern crate alloc;
 
+mod address_allocator;
 mod buffer_ptrs;
 mod capability_regs;
 mod common_descriptor;
 mod configuration_descriptor;
+mod delay;
 mod device;
 mod device_descriptor;
 mod device_greeter;
+mod ehci_mutex;
+mod ehci_runner;
 mod endpoint_descriptor;
 mod endpoint_speed;
 mod hub_descriptor;
