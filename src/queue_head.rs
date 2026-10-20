@@ -8,7 +8,7 @@ use crate::{
 };
 
 #[bitfield(u32, debug)]
-pub struct QueueHeadHorizontalLinkPtr {
+pub struct QhHorizontalLinkPtr {
     #[bit(0, rw)]
     terminate: bool,
     #[bits(1..=2, rw)]
@@ -17,7 +17,7 @@ pub struct QueueHeadHorizontalLinkPtr {
     ptr_upper: u27,
 }
 
-impl QueueHeadHorizontalLinkPtr {
+impl QhHorizontalLinkPtr {
     pub const INVALID: Self = Self::new_with_raw_value(0).with_terminate(true);
 
     pub fn new(select_type: SelectType, ptr: u32) -> Self {
@@ -27,9 +27,12 @@ impl QueueHeadHorizontalLinkPtr {
             .with_ptr_upper(u27::new(ptr >> 5))
     }
 
-    /// Assumes it is valid
-    pub fn ptr(&self) -> u32 {
-        self.ptr_upper().value() << 5
+    pub fn ptr(&self) -> Option<u32> {
+        if self.terminate() {
+            None
+        } else {
+            Some(self.ptr_upper().value() << 5)
+        }
     }
 }
 
@@ -102,7 +105,7 @@ pub struct AlternateQtdLinkPtr {
 impl AlternateQtdLinkPtr {
     pub const INVALID: Self = Self::new_with_raw_value(0).with_terminate(true);
 
-    pub fn new(ptr: u32) -> Self {
+    pub fn new_valid(ptr: u32) -> Self {
         Self::builder()
             .with_terminate(false)
             .with_nak_count(u4::new(0))
@@ -141,8 +144,8 @@ pub struct QhBufferPtrPage3P {
 
 #[repr(C, align(32))]
 #[derive(Debug, Clone, Copy, VolatileFieldAccess)]
-pub struct QueueHead {
-    pub(crate) queue_head_horizontal_link_ptr: QueueHeadHorizontalLinkPtr,
+pub struct Qh {
+    pub(crate) horizontal_link_ptr: QhHorizontalLinkPtr,
     pub(crate) endpoint_characteristics: EndpointCharacteristics,
     pub(crate) endpoint_capabilities: EndpointCapabilities,
     pub(crate) current_qtd_pointer: CurrentQtdLinkPtr,
@@ -162,13 +165,13 @@ pub struct QueueHead {
     pub(crate) extended_buffer_ptr_page_4: u32,
 }
 
-impl QueueHead {
+impl Qh {
     pub(crate) fn new(
         endpoint_characteristics: EndpointCharacteristics,
         endpoint_capabilities: EndpointCapabilities,
     ) -> Self {
         Self {
-            queue_head_horizontal_link_ptr: QueueHeadHorizontalLinkPtr::INVALID,
+            horizontal_link_ptr: QhHorizontalLinkPtr::INVALID,
             endpoint_characteristics,
             endpoint_capabilities,
             current_qtd_pointer: CurrentQtdLinkPtr::ZERO,
@@ -197,4 +200,16 @@ impl QueueHead {
             )
         }
     }
+
+    // pub unsafe fn link_qtds(&mut self, qtds: &[MappedMem<Qtd>], ctrl_ds_segment: CtrlDsSegment) {
+    //     if qtds.len() == 0 {
+    //         return;
+    //     }
+    //     self.next_qtd_pointer =
+    //         NextQtdPointer::new_valid(get_addr_offset(qtds[0].phys_addr, ctrl_ds_segment));
+    //     for i in 0..qtds.len() - 1 {
+    //         let qtd = unsafe { VolatilePtr::new(qtds[i].ptr)};
+    //         qtd.next_qtd_ptr().write(value);
+    //     }
+    // }
 }

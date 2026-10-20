@@ -1,3 +1,5 @@
+use arbitrary_int::u7;
+
 /// Allocates addresses from 1..=127.
 #[derive(Debug)]
 pub struct AddressAllocator {
@@ -14,17 +16,17 @@ impl Default for AddressAllocator {
 }
 
 impl AddressAllocator {
-    pub fn allocate_addr(&mut self) -> Option<u8> {
+    pub fn allocate_addr(&mut self) -> Option<u7> {
         let addr = self.allocated_addresses.trailing_ones().try_into().unwrap();
         if addr <= 127 {
             self.allocated_addresses |= 1_u128 << addr;
-            Some(addr)
+            Some(u7::new(addr))
         } else {
             None
         }
     }
 
-    pub fn deallocate_addr(&mut self, addr: u8) {
-        self.allocated_addresses &= !(1 << addr);
+    pub fn deallocate_addr(&mut self, addr: u7) {
+        self.allocated_addresses &= !(1 << addr.value());
     }
 }

@@ -1,5 +1,6 @@
 use arbitrary_int::{u2, u4, u11};
 use bitbybit::bitfield;
+use num_enum::{FromPrimitive, IntoPrimitive, TryFromPrimitive};
 use zerocopy::{FromBytes, Immutable, KnownLayout, little_endian::U16};
 
 #[repr(C)]
@@ -55,4 +56,25 @@ pub struct EndpointMaxPacketSize {
     /// Only applies to isochronous endpoints, range is 0..=2. 3 is reserved.
     #[bits(11..=12, rw)]
     pub additional_transaction_opportunities_per_microframe: u2,
+}
+
+#[derive(Debug, TryFromPrimitive, IntoPrimitive)]
+#[repr(u8)]
+pub enum TransferType {
+    Control = 0,
+    Isochronous = 1,
+    Bulk = 2,
+    Interrupt = 3,
+}
+
+impl From<u2> for TransferType {
+    fn from(value: u2) -> Self {
+        Self::try_from(value.value()).unwrap()
+    }
+}
+
+impl From<TransferType> for u2 {
+    fn from(value: TransferType) -> Self {
+        Self::new(value.into())
+    }
 }

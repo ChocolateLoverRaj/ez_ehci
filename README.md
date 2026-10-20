@@ -136,6 +136,16 @@ Within the QH you can actually make a circular linked list of QTDs, like a ring 
 Depending on the eHCI, there are either 1024 slots (meaning that it takes 1024 ms to go through the entire list), or, if supported, you can choose if you want 1024, 512, or 256 slots. Choosing 256 slots as the size is really for computers where 3 KiB of RAM usage (how much you save by selecting 256 slots) savings matters. You are probably not in such as resource-constrained environment. So just don't care if smaller frame list sizes are supported, and stick to 1024, which will always be supported.
 
 # Design Choices
+## Key structs
+- QH with metadata (128 B)
+  - Actual QH is 96 B (128 B rounded to its align of 32 B)
+  - Without 64-bit support this is 48 B (64 B rounded to its align of 32 B)
+  - A QH without 64-bit support but with meta-data would be 64 B
+  - May be worth having a variant without 64-bit support?
+- QTD (64 B)
+  - QTD without 64-bit support is 32 B
+  - QTD with 64-bit support is 52 B, so we could use those 12 B of padding to store something if we want
+- Periodic frame list (4096 B)
 ## Things to consider
 - I am new to writing drivers. I started writing an xHCI driver based on [Stellux OS's Tutorial](https://www.youtube.com/watch?v=W0EqQiDSoxE)
 - My "OS" is currently a kernel with a single thread which runs on a single core, with an async executor

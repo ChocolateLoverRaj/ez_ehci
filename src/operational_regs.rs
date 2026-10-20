@@ -1,4 +1,4 @@
-use arbitrary_int::{u2, u4, u27};
+use arbitrary_int::{u2, u4, u26, u27, u31};
 use bitbybit::bitfield;
 use debug_ignore::DebugIgnore;
 use num_enum::TryFromPrimitive;
@@ -61,6 +61,8 @@ pub struct UsbIntrReg {
     pub host_system_error_interrupt_enable: bool,
     #[bit(5, rw)]
     pub interrupt_on_async_advance_enable: bool,
+    #[bits(6..=31, rw)]
+    pub reserved: u26,
 }
 
 #[bitfield(u32, debug)]
@@ -74,8 +76,8 @@ pub struct AsyncListAddrReg {
 }
 
 impl AsyncListAddrReg {
-    pub fn new(addr: u32) -> Self {
-        Self::new_with_raw_value(0).with_link_pointer_low(u27::new(addr >> 5))
+    pub fn new(addr_offset: u32) -> Self {
+        Self::new_with_raw_value(0).with_link_pointer_low(u27::new(addr_offset >> 5))
     }
 }
 
@@ -85,6 +87,8 @@ pub struct ConfigFlagReg {
     /// 1: ports routed to this controller by default.
     #[bit(0, rw)]
     pub configure_flag: bool,
+    #[bits(1..=31, rw)]
+    pub reserved: u31,
 }
 
 #[bitfield(u32, debug)]
@@ -170,5 +174,5 @@ pub struct OperationalRegs {
     pub reserved: DebugIgnore<[u8; 36]>,
     pub config_flag: ConfigFlagReg,
     /// The size of this depends on the number of ports at runtime.
-    pub port_sc: DebugIgnore<[PortScReg; 0]>,
+    pub port_sc: [PortScReg; 0],
 }

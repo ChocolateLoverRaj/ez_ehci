@@ -1,62 +1,79 @@
 #![no_std]
-#![feature(vec_push_within_capacity)]
+#![feature(sync_unsafe_cell)]
 extern crate alloc;
 
 mod address_allocator;
+mod async_list_manager;
 mod buffer_ptrs;
 mod capability_regs;
 mod common_descriptor;
 mod configuration_descriptor;
+mod control_endpoint;
+mod control_endpoint_shared;
 mod delay;
 mod device;
 mod device_descriptor;
-mod device_greeter;
-mod ehci_mutex;
+mod device_info;
+mod device_shared;
+mod ehci_control;
+mod ehci_control_common;
 mod ehci_runner;
 mod endpoint_descriptor;
 mod endpoint_speed;
+mod error;
+mod hub;
 mod hub_descriptor;
-mod initialized_ehci;
 mod interface_descriptor;
+mod interrupt_endpoint;
+mod interrupt_endpoint_shared;
 mod irq_handler;
+mod mapped_mem;
 mod new_ehci;
+mod oneshot;
 mod operational_regs;
-mod os_owned_ehci;
 mod pci;
 mod periodic_list;
-mod qh_manager;
+mod periodic_list_manager;
+mod poll_strategy;
 mod qtd;
 mod queue_head;
+mod root_port;
 mod root_port_number;
+mod root_port_shared;
+mod runner;
 mod setup_packet;
+mod signal;
+mod stack;
+mod start_config;
 mod transfer_token;
 mod usb_leg_sup;
+mod util;
 
-use core::{fmt::Debug, num::NonZero, ptr::NonNull};
+use core::{fmt::Debug, num::NonZero};
 
 use bitbybit::bitfield;
 use volatile::{VolatilePtr, access::ReadOnly};
 
 use crate::capability_regs::{CapabilityRegs, CapabilityRegsVolatileFieldAccess};
 pub use crate::{
-    device::{Device, GetInfoBuffer},
+    delay::Delay,
+    device::ConfiguredDeviceOrHub,
+    device::{Device, EndpointEnum, GetInfoResources, SetConfigurationResources},
     device_descriptor::DeviceDescriptor,
-    device_greeter::DeviceGreeterWaitingForDevice,
-    initialized_ehci::{InitDeviceBuffer, InitializedEhci, NewDeviceEvent},
+    hub::Hub,
+    interrupt_endpoint::{InterruptEndpoint, WatchInterruptResources, WatchedInterruptEndpoint},
     irq_handler::IrqHandler,
+    mapped_mem::MappedMem,
     new_ehci::{AnyEhci, new_ehci},
-    os_owned_ehci::{EhciParts, OsOwnedEhci},
     pci::{PCI_CLASS, PCI_PROG_IF, PCI_SUBCLASS, PciAccess},
     periodic_list::PeriodicFrameList,
-    queue_head::QueueHead,
+    poll_strategy::PollStrategy,
+    queue_head::Qh,
+    root_port_shared::ResetDeviceResources,
+    stack::Stack,
+    start_config::{CtrlDsSegment, StartConfig},
     usb_leg_sup::{BiosOwnedEhci, TakingOwnershipEhci, TryTakeOutput},
 };
-
-#[derive(Debug, Clone, Copy)]
-pub struct MappedMem<T: ?Sized> {
-    pub phys_addr: u32,
-    pub ptr: NonNull<T>,
-}
 
 #[bitfield(u32, debug)]
 struct ExtendedCapabilityPointerReg {

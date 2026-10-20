@@ -1,8 +1,9 @@
 use core::{num::NonZero, ptr::NonNull};
 
+use alloc::boxed::Box;
 use bitbybit::bitfield;
 
-use crate::{OsOwnedEhci, PciAccess};
+use crate::{PciAccess, Stack, delay::Delay};
 
 #[bitfield(u32, debug)]
 pub struct UsbLegSupReg {
@@ -56,6 +57,7 @@ pub struct BiosOwnedEhci<P: PciAccess> {
     pub(crate) mapped_bar: NonNull<[u8]>,
     pub(crate) pci_access: P,
     pub(crate) usb_leg_sup_offset: NonZero<u8>,
+    pub(crate) delay: Box<dyn Delay>,
 }
 
 impl<P: PciAccess> BiosOwnedEhci<P> {
@@ -68,6 +70,7 @@ impl<P: PciAccess> BiosOwnedEhci<P> {
             mapped_bar: self.mapped_bar,
             pci_access: self.pci_access,
             usb_leg_sup_offset: self.usb_leg_sup_offset,
+            delay: self.delay,
         }
     }
 }
@@ -76,11 +79,12 @@ pub struct TakingOwnershipEhci<P: PciAccess> {
     mapped_bar: NonNull<[u8]>,
     pci_access: P,
     usb_leg_sup_offset: NonZero<u8>,
+    delay: Box<dyn Delay>,
 }
 
 pub enum TryTakeOutput<P: PciAccess> {
     NotYet(TakingOwnershipEhci<P>),
-    Taken(OsOwnedEhci),
+    Taken(Stack),
 }
 
 impl<P: PciAccess> TakingOwnershipEhci<P> {
@@ -114,7 +118,7 @@ impl<P: PciAccess> TakingOwnershipEhci<P> {
             // );
             // log::warn!("USB legacy control/status: {sts:#X?}");
             // todo!();
-            TryTakeOutput::Taken(unsafe { OsOwnedEhci::new(self.mapped_bar) })
+            TryTakeOutput::Taken(unsafe { Stack::new(self.mapped_bar, self.delay) })
         }
     }
 }

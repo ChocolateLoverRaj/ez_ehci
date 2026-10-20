@@ -1,16 +1,21 @@
 use core::ptr::NonNull;
 
+use alloc::boxed::Box;
 use volatile::VolatilePtr;
 
 use crate::{
-    BiosOwnedEhci, ExtendedCapabilitiesIterator, ExtendedCapability, OsOwnedEhci, PciAccess,
-    capability_regs::CapabilityRegs,
+    BiosOwnedEhci, ExtendedCapabilitiesIterator, ExtendedCapability, PciAccess, Stack,
+    capability_regs::CapabilityRegs, delay::Delay,
 };
 
 /// # Safety
 /// - `mapped_bar` must be the virtual address pointing to the bar.
 /// - The entire BAR 0 must be mapped with the right caching type.
-pub unsafe fn new_ehci<P: PciAccess>(mapped_bar: NonNull<[u8]>, mut pci_access: P) -> AnyEhci<P> {
+pub unsafe fn new_ehci<P: PciAccess>(
+    mapped_bar: NonNull<[u8]>,
+    mut pci_access: P,
+    delay: Box<dyn Delay>,
+) -> AnyEhci<P> {
     let capability_regs = unsafe {
         VolatilePtr::<CapabilityRegs>::new_read_only(mapped_bar.cast::<CapabilityRegs>())
     };
@@ -30,13 +35,14 @@ pub unsafe fn new_ehci<P: PciAccess>(mapped_bar: NonNull<[u8]>, mut pci_access: 
             mapped_bar,
             pci_access,
             usb_leg_sup_offset,
+            delay,
         })
     } else {
-        AnyEhci::OsOwned(unsafe { OsOwnedEhci::new(mapped_bar) })
+        AnyEhci::OsOwned(unsafe { Stack::new(mapped_bar, delay) })
     }
 }
 
 pub enum AnyEhci<P: PciAccess> {
     BiosOwned(BiosOwnedEhci<P>),
-    OsOwned(OsOwnedEhci),
+    OsOwned(Stack),
 }

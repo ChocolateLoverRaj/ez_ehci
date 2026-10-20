@@ -20,6 +20,13 @@ pub struct PeriodicFrameListElement {
 }
 
 impl PeriodicFrameListElement {
+    pub const NONE: Self = Self::builder()
+        .with_t(true)
+        .with_typ(u2::ZERO)
+        .with_reserved(u2::ZERO)
+        .with_addr_upper_bits(u27::ZERO)
+        .build();
+
     pub fn new(select_type: SelectType, addr: u32) -> Self {
         Self::builder()
             .with_t(false)
@@ -34,4 +41,10 @@ impl PeriodicFrameListElement {
 #[derive(Debug, Clone, Copy, VolatileFieldAccess)]
 pub struct PeriodicFrameList {
     pub(crate) elements: [PeriodicFrameListElement; 1024],
+}
+
+impl PeriodicFrameList {
+    pub const EMPTY: Self = Self {
+        elements: [PeriodicFrameListElement::NONE; _],
+    };
 }
