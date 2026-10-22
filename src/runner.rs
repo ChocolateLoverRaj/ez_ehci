@@ -9,7 +9,6 @@ use core::{
 
 use alloc::{boxed::Box, collections::BTreeMap, sync::Arc, vec::Vec};
 use arbitrary_int::{traits::Integer, u4, u7, u11, u15, u26, u31};
-use debug_ignore::DebugIgnore;
 use futures::FutureExt;
 use volatile::{VolatilePtr, VolatileRef, access::ReadOnly};
 use zerocopy::transmute;
@@ -20,9 +19,10 @@ use crate::{
     async_list_manager::{AsyncListManager, QhWithMetaA, QhWithMetaAVolatileFieldAccess},
     buffer_ptrs::BufferPtrs,
     capability_regs::{CapabilityRegs, CapabilityRegsVolatileFieldAccess},
+    control_endpoint_shared::ControlEndpointSharedState,
     delay::Delay,
     device::Device,
-    device_shared::{DeviceReq, DeviceSharedState},
+    device_shared::DeviceSharedState,
     ehci_control_common::{ControlReq, ControlSharedState},
     endpoint_speed::EndpointSpeed,
     error::Error,
@@ -82,7 +82,8 @@ enum RunnerState {
         ctrl_ds_segment: CtrlDsSegment,
         qh_manager: AsyncListManager,
         devices: BTreeMap<RootPortNumber, Arc<DeviceSharedState>>,
-        endpoints: Vec<Arc<InterruptEndpointSharedState>>,
+        interrupt_endpoints: Vec<Arc<InterruptEndpointSharedState>>,
+        control_endpoints: Vec<Arc<ControlEndpointSharedState>>,
         periodic_list_manager: PeriodicListManager,
     },
 }
@@ -281,7 +282,8 @@ impl Runner {
                                 periodic_frame_list,
                                 ctrl_ds_segment,
                             ),
-                            endpoints: Default::default(),
+                            interrupt_endpoints: Default::default(),
+                            control_endpoints: Default::default(),
                         };
                         self.control_shared_state.res_signal.signal(Ok(()));
                     } else {
@@ -304,10 +306,11 @@ impl Runner {
                     resetting_device: resetting_device_option,
                     addr_allocator,
                     ctrl_ds_segment,
-                    qh_manager,
+                    qh_manager: async_list_manager,
                     devices,
                     periodic_list_manager,
-                    endpoints,
+                    interrupt_endpoints,
+                    control_endpoints,
                 } => {
                     future::poll_fn(|cx| {
                         self.irq_handler_shared.runner_waker.register(cx.waker());
@@ -320,11 +323,17 @@ impl Runner {
                             .irq_handler_shared
                             .new_usb_err_int
                             .swap(false, Ordering::Relaxed);
+                        if usb_err_int {
+                            log::warn!("usb err int");
+                        }
                         if usb_int || usb_err_int {
                             for device in devices.values_mut() {
                                 device.usb_int_signal.signal(());
                             }
-                            for endpoint in endpoints.iter_mut() {
+                            for endpoint in interrupt_endpoints.iter_mut() {
+                                endpoint.int_signal.signal(());
+                            }
+                            for endpoint in control_endpoints.iter_mut() {
                                 endpoint.int_signal.signal(());
                             }
                         }
@@ -334,7 +343,7 @@ impl Runner {
                             .new_async_advance
                             .swap(false, Ordering::Relaxed);
                         if async_advance {
-                            qh_manager.handle_async_advance(unsafe {
+                            async_list_manager.handle_async_advance(unsafe {
                                 VolatileRef::new(
                                     self.operational_regs.as_mut_ptr().usb_cmd().as_raw_ptr(),
                                 )
@@ -353,22 +362,20 @@ impl Runner {
 
                         for device in devices.values_mut() {
                             if let Poll::Ready(req) = device.req_signal.poll_wait(cx) {
-                                match req {
-                                    DeviceReq::AddQh(req) => {
-                                        qh_manager.add_qh_to_async_list(req.add_qh);
-                                        req.callback.send(());
-                                    }
-                                    DeviceReq::AddEndpoint(req) => {
-                                        endpoints.push(req.endpoint_shared);
-                                    }
-                                }
+                                interrupt_endpoints.push(req.endpoint_shared);
                             }
                         }
 
-                        for endpoint in endpoints.iter_mut() {
+                        for endpoint in interrupt_endpoints.iter_mut() {
                             if let Poll::Ready(req) = endpoint.req_signal.poll_wait(cx) {
                                 periodic_list_manager.add_qh(req.qh, req.interval);
                                 req.callback.send(());
+                            }
+                        }
+
+                        for endpoint in control_endpoints.iter_mut() {
+                            if let Poll::Ready(req) = endpoint.req_signal.poll_wait(cx) {
+                                async_list_manager.add_qh_to_async_list(req);
                             }
                         }
 
@@ -499,7 +506,7 @@ impl Runner {
                                                     *ctrl_ds_segment,
                                                 ));
                                             qh_ptr.qh().write(qh);
-                                            qh_manager
+                                            async_list_manager
                                                 .add_qh_to_async_list(resetting_device.req.qh);
                                             resetting_device.step =
                                                 ResetDeviceStep::WaitForSetAddr {
@@ -520,7 +527,7 @@ impl Runner {
                                         };
                                         if !status_qtd.qtd_token().read().active() {
                                             let (tx, rx) = oneshot();
-                                            qh_manager.queue_remove_qh(
+                                            async_list_manager.queue_remove_qh(
                                                 unsafe {
                                                     VolatileRef::new(
                                                         self.operational_regs
@@ -546,15 +553,22 @@ impl Runner {
                                         qh_manager_rx,
                                     } => {
                                         if qh_manager_rx.poll_unpin(cx).is_ready() {
-                                            let shared = Arc::new(DeviceSharedState::default());
-                                            devices
-                                                .insert(resetting_device.root_port, shared.clone());
+                                            let device_shared =
+                                                Arc::new(DeviceSharedState::default());
+                                            let ep0_shared =
+                                                Arc::new(ControlEndpointSharedState::default());
+                                            devices.insert(
+                                                resetting_device.root_port,
+                                                device_shared.clone(),
+                                            );
+                                            control_endpoints.push(ep0_shared.clone());
                                             self.root_ports_shared[root_port_index]
                                                 .res_signal
                                                 .signal(Ok(Device::new(
-                                                    shared,
+                                                    device_shared,
                                                     *ctrl_ds_segment,
                                                     *addr,
+                                                    ep0_shared,
                                                 )));
                                             *resetting_device_option = None;
                                         } else {

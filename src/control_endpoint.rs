@@ -49,7 +49,8 @@ impl ControlEndpoint {
                     // We know the device is USB 2.0, so min max packet len is 64
                     // We can use >64 after we read the device descriptor
                     64
-                })),
+                }))
+                .with_data_toggle_control(true),
             EndpointCapabilities::ZERO,
         );
         // Make sure the eHCI doesn't try to read any QTDs or do any transfers
@@ -57,6 +58,7 @@ impl ControlEndpoint {
         qh.transfer_token.set_halted(true);
         let mut qh_ptr = unsafe { VolatileRef::new(qh_mem.ptr) };
         qh_ptr.as_mut_ptr().qh().write(qh);
+        self.shared.req_signal.signal(qh_mem);
         LoadedControlEndpoint {
             qh: qh_ptr,
             ctrl_ds_segment: self.ctrl_ds_segment,
@@ -76,22 +78,23 @@ impl LoadedControlEndpoint {
         &self,
         setup_packet: MappedMem<[u8; 8]>,
         setup_qtd_mem: MappedMem<Qtd>,
+        next_qtd_mem: MappedMem<Qtd>,
     ) {
         let mut setup_qtd = Qtd::new(
             TransferToken::new_active(PidCode::SetupToken, u15::new(8)),
             BufferPtrs::new_contiguous(setup_packet.phys_addr, 8),
         );
         setup_qtd.next_qtd_ptr = NextQtdPointer::new_valid(get_addr_offset(
-            setup_qtd_mem.phys_addr,
+            next_qtd_mem.phys_addr,
             self.ctrl_ds_segment,
         ));
         let setup_qtd_ptr = unsafe { VolatilePtr::new(setup_qtd_mem.ptr) };
         setup_qtd_ptr.write(setup_qtd);
     }
 
-    unsafe fn write_status_qtd(&self, status_qtd_mem: MappedMem<Qtd>) {
+    unsafe fn write_status_qtd(&self, status_qtd_mem: MappedMem<Qtd>, pid: PidCode) {
         let status_qtd = Qtd::new(
-            TransferToken::new_active(PidCode::OutToken, u15::ZERO)
+            TransferToken::new_active(pid, u15::ZERO)
                 .with_data_toggle(true)
                 .with_interrupt_on_complete(true),
             BufferPtrs::ZERO,
@@ -125,18 +128,20 @@ impl LoadedControlEndpoint {
         }
     }
 
-    pub async fn transfer_no_data(
+    pub async unsafe fn transfer_no_data(
         &mut self,
         setup_packet: MappedMem<[u8; 8]>,
         qtds: [MappedMem<Qtd>; 2],
     ) {
+        let setup_qtd_mem = qtds[0];
+        let status_qtd_mem = qtds[1];
         unsafe {
-            self.write_setup_qtd(setup_packet, qtds[0]);
+            self.write_setup_qtd(setup_packet, setup_qtd_mem, status_qtd_mem);
         }
         unsafe {
-            self.write_status_qtd(qtds[1]);
+            self.write_status_qtd(status_qtd_mem, PidCode::InToken);
         }
-        unsafe { self.attach_qtd(qtds[0]) };
+        unsafe { self.attach_qtd(setup_qtd_mem) };
         let status_qtd_ptr = unsafe { VolatileRef::new(qtds[1].ptr) };
         self.wait_for_qtd_complete(status_qtd_ptr).await;
     }
@@ -145,48 +150,49 @@ impl LoadedControlEndpoint {
     pub async unsafe fn transfer_in(
         &mut self,
         setup_packet: MappedMem<[u8; 8]>,
-        buffers: &mut [MappedMem<[u8]>],
-        qtds: &mut [MappedMem<Qtd>],
+        buffers: &[MappedMem<[u8]>],
+        qtds: &[MappedMem<Qtd>],
     ) -> u16 {
         assert!(!buffers.is_empty());
         assert_eq!(qtds.len(), 1 + buffers.len() + 1);
+        let setup_qtd_mem = qtds[0];
+        let status_qtd_mem = *qtds.last().unwrap();
         unsafe {
-            self.write_setup_qtd(setup_packet, qtds[0]);
+            self.write_setup_qtd(setup_packet, setup_qtd_mem, qtds[1]);
         }
-        let status_addr_offset = get_addr_offset(qtds[2].phys_addr, self.ctrl_ds_segment);
+        let status_addr_offset = get_addr_offset(status_qtd_mem.phys_addr, self.ctrl_ds_segment);
         let alternate_qtd_ptr = AlternateQtdLinkPtr::new_valid(status_addr_offset);
         for i in 0..buffers.len() {
             let buffer = buffers[i];
-            let in_qtd_mem = qtds[i];
+            let in_qtd_mem = qtds[i + 1];
             let mut in_qtd = Qtd::new(
                 TransferToken::new_active(
                     PidCode::InToken,
                     u15::new(buffer.ptr.len().try_into().unwrap()),
                 )
-                .with_data_toggle(false)
+                .with_data_toggle(true)
                 .with_interrupt_on_complete(true),
                 BufferPtrs::new_contiguous(buffer.phys_addr, buffer.ptr.len().try_into().unwrap()),
             );
             in_qtd.next_qtd_ptr = NextQtdPointer::new_valid(get_addr_offset(
-                qtds[i + 1].phys_addr,
+                qtds[1 + i + 1].phys_addr,
                 self.ctrl_ds_segment,
             ));
             in_qtd.alternate_next_qtd_ptr = alternate_qtd_ptr;
             let in_qtd_ptr = unsafe { VolatilePtr::new(in_qtd_mem.ptr) };
             in_qtd_ptr.write(in_qtd);
         }
-        let status_qtd = *qtds.last().unwrap();
         unsafe {
-            self.write_status_qtd(status_qtd);
+            self.write_status_qtd(status_qtd_mem, PidCode::OutToken);
         }
         unsafe { self.attach_qtd(qtds[0]) };
-        let status_qtd_ptr = unsafe { VolatileRef::new(status_qtd.ptr) };
+        let status_qtd_ptr = unsafe { VolatileRef::new(status_qtd_mem.ptr) };
         self.wait_for_qtd_complete(status_qtd_ptr).await;
 
         let mut bytes_transferred = 0;
         for i in 0..buffers.len() {
             let buffer_mem = buffers[i];
-            let in_qtd_mem = qtds[i];
+            let in_qtd_mem = qtds[i + 1];
             let in_qtd_ptr = unsafe { VolatilePtr::new(in_qtd_mem.ptr) };
             let max_transfer_size = u16::try_from(buffer_mem.ptr.len()).unwrap();
             bytes_transferred += max_transfer_size

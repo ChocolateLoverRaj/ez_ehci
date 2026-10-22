@@ -4,23 +4,17 @@ use volatile::VolatilePtr;
 use zerocopy::{FromBytes, transmute};
 
 use crate::{
-    CtrlDsSegment, DeviceDescriptor, InterruptEndpoint, MappedMem, Qh,
-    async_list_manager::{QhWithMetaA, QhWithMetaAVolatileFieldAccess},
-    buffer_ptrs::BufferPtrs,
+    CtrlDsSegment, DeviceDescriptor, InterruptEndpoint, MappedMem,
+    async_list_manager::QhWithMetaA,
+    control_endpoint::{ControlEndpoint, LoadedControlEndpoint},
+    control_endpoint_shared::ControlEndpointSharedState,
     device_info::{ConfigurationInfo, DeviceInfo},
-    device_shared::{AddEndpointReq, AddQhReq, DeviceReq, DeviceSharedState},
+    device_shared::{AddEndpointReq, DeviceSharedState},
     endpoint_descriptor::TransferType,
-    endpoint_speed::EndpointSpeed,
     hub::Hub,
     interrupt_endpoint_shared::InterruptEndpointSharedState,
-    oneshot::oneshot,
-    qtd::{NextQtdPointer, Qtd, QtdVolatileFieldAccess},
-    queue_head::{
-        AlternateQtdLinkPtr, EndpointCapabilities, EndpointCharacteristics, QhVolatileFieldAccess,
-    },
+    qtd::Qtd,
     setup_packet::SetupPacket,
-    transfer_token::{PidCode, TransferToken},
-    util::get_addr_offset,
 };
 
 /// A device was reset, confirmed to be high speed, and assigned an address.
@@ -31,6 +25,7 @@ pub struct Device {
     address: u7,
     shared: Arc<DeviceSharedState>,
     ctrl_ds_segment: CtrlDsSegment,
+    ep0: ControlEndpoint,
 }
 
 impl Device {
@@ -38,11 +33,13 @@ impl Device {
         shared: Arc<DeviceSharedState>,
         ctrl_ds_segment: CtrlDsSegment,
         address: u7,
+        ep0_shared: Arc<ControlEndpointSharedState>,
     ) -> Self {
         Self {
             ctrl_ds_segment,
             address,
             shared,
+            ep0: ControlEndpoint::new(ep0_shared, address, u4::ZERO, ctrl_ds_segment),
         }
     }
 
@@ -50,41 +47,14 @@ impl Device {
         self.address
     }
 
-    pub async unsafe fn add_ep0(self, qh_mem: MappedMem<QhWithMetaA>) -> DeviceWithEp0 {
-        let mut qh = Qh::new(
-            EndpointCharacteristics::new_with_raw_value(0)
-                .with_head_of_reclamation_list_flag(false)
-                .with_device_addr(self.address)
-                .with_endpoint_number({
-                    // control endpoint
-                    u4::ZERO
-                })
-                .with_endpoint_speed(EndpointSpeed::High.into())
-                .with_max_packet_len(u11::new({
-                    // We know the device is USB 2.0, so min max packet len is 64
-                    // We can use >64 after we read the device descriptor
-                    64
-                })),
-            EndpointCapabilities::ZERO,
-        );
-        // Make sure the eHCI doesn't try to read any QTDs or do any transfers
-        qh.next_qtd_pointer = NextQtdPointer::INVALID;
-        qh.transfer_token.set_halted(true);
-        let qh_ptr = unsafe { VolatilePtr::new(qh_mem.ptr) };
-        qh_ptr.qh().write(qh);
+    pub async unsafe fn load(self, qh_mem: MappedMem<QhWithMetaA>) -> LoadedDevice {
+        let ep0 = unsafe { self.ep0.load(qh_mem) }.await;
 
-        let (tx, rx) = oneshot();
-        self.shared.req_signal.signal(DeviceReq::AddQh(AddQhReq {
-            add_qh: qh_mem,
-            callback: tx,
-        }));
-        rx.await.unwrap();
-
-        DeviceWithEp0 {
+        LoadedDevice {
             address: self.address,
             ctrl_ds_segment: self.ctrl_ds_segment,
-            qh: qh_mem,
             shared: self.shared,
+            ep0,
         }
     }
 }
@@ -100,72 +70,16 @@ pub struct GetInfoResources {
     pub buffer: MappedMem<[u8; MAX_CONFIGURATION_DESCRIPTOR_LEN]>,
 }
 
-pub struct DeviceWithEp0 {
+pub struct LoadedDevice {
     address: u7,
     shared: Arc<DeviceSharedState>,
     ctrl_ds_segment: CtrlDsSegment,
-    qh: MappedMem<QhWithMetaA>,
+    ep0: LoadedControlEndpoint,
 }
 
-impl DeviceWithEp0 {
+impl LoadedDevice {
     pub fn address(&self) -> u7 {
         self.address
-    }
-
-    /// This function does not write to the setup buffer. It's the caller's responsibility to do that before calling this fn.
-    unsafe fn attach_get_descriptor_request(
-        &self,
-        qtds: [MappedMem<Qtd>; 3],
-        setup_buffer: MappedMem<[u8; 8]>,
-        buffer: MappedMem<[u8]>,
-    ) {
-        // SETUP
-        let mut setup_qtd = Qtd::new(
-            TransferToken::new_active(PidCode::SetupToken, u15::new(8)),
-            BufferPtrs::new_contiguous(setup_buffer.phys_addr, 8),
-        );
-        setup_qtd.next_qtd_ptr =
-            NextQtdPointer::new_valid(get_addr_offset(qtds[1].phys_addr, self.ctrl_ds_segment));
-        let setup_qtd_ptr = unsafe { VolatilePtr::new(qtds[0].ptr) };
-        setup_qtd_ptr.write(setup_qtd);
-        // IN
-        let mut in_qtd = Qtd::new(
-            TransferToken::new_active(
-                PidCode::InToken,
-                u15::new(buffer.ptr.len().try_into().unwrap()),
-            )
-            .with_data_toggle(false)
-            .with_interrupt_on_complete(true),
-            BufferPtrs::new_contiguous(buffer.phys_addr, buffer.ptr.len().try_into().unwrap()),
-        );
-        let status_addr_offset = get_addr_offset(qtds[2].phys_addr, self.ctrl_ds_segment);
-        in_qtd.next_qtd_ptr = NextQtdPointer::new_valid(status_addr_offset);
-        in_qtd.alternate_next_qtd_ptr = AlternateQtdLinkPtr::new_valid(status_addr_offset);
-        let in_qtd_ptr = unsafe { VolatilePtr::new(qtds[1].ptr) };
-        in_qtd_ptr.write(in_qtd);
-        // Status
-        let status_qtd = Qtd::new(
-            TransferToken::new_active(PidCode::OutToken, u15::ZERO)
-                .with_data_toggle(true)
-                .with_interrupt_on_complete(true),
-            BufferPtrs::ZERO,
-        );
-        let status_qtd_ptr = unsafe { VolatilePtr::new(qtds[2].ptr) };
-        status_qtd_ptr.write(status_qtd);
-
-        // Actually add the QTD chain to the QH
-        let qh_ptr = unsafe { VolatilePtr::new(self.qh.ptr) };
-        qh_ptr
-            .qh()
-            .next_qtd_pointer()
-            .write(NextQtdPointer::new_valid(get_addr_offset(
-                qtds[0].phys_addr,
-                self.ctrl_ds_segment,
-            )));
-        qh_ptr
-            .qh()
-            .transfer_token()
-            .write(TransferToken::new_with_raw_value(0));
     }
 
     async unsafe fn get_descriptor<'a>(
@@ -174,25 +88,16 @@ impl DeviceWithEp0 {
         setup_buffer: MappedMem<[u8; 8]>,
         buffer: MappedMem<[u8]>,
     ) -> &'a [u8] {
-        unsafe { self.attach_get_descriptor_request(qtds, setup_buffer, buffer) };
-        let in_qtd_ptr = unsafe { VolatilePtr::new(qtds[1].ptr) };
-        let status_qtd_ptr = unsafe { VolatilePtr::new(qtds[2].ptr) };
-        loop {
-            if !status_qtd_ptr.qtd_token().read().active() {
-                break;
-            }
-            self.shared.usb_int_signal.wait().await;
-        }
-
+        let buffers = [buffer];
+        let bytes_transferred =
+            unsafe { self.ep0.transfer_in(setup_buffer, &buffers, &qtds) }.await;
         let buffer_ptr = unsafe { VolatilePtr::new(buffer.ptr) };
-        let bytes_transferred = MAX_CONFIGURATION_DESCRIPTOR_LEN
-            - in_qtd_ptr
-                .qtd_token()
-                .read()
-                .total_bytes_to_transfer()
-                .value()
-                .as_usize();
-        unsafe { buffer_ptr.index(..bytes_transferred).as_raw_ptr().as_ref() }
+        unsafe {
+            buffer_ptr
+                .index(..bytes_transferred.try_into().unwrap())
+                .as_raw_ptr()
+                .as_ref()
+        }
     }
 
     async unsafe fn get_configuration_descriptor<'a>(
@@ -223,7 +128,7 @@ impl DeviceWithEp0 {
         .await;
         log::info!("device descriptor: {device_descriptor:02X?}");
         let device_descriptor = DeviceDescriptor::read_from_bytes(device_descriptor).unwrap();
-        log::info!("{device_descriptor:#?}");
+        log::debug!("{device_descriptor:#?}");
         let mut configurations = Vec::new();
         for n in 0..device_descriptor.b_num_configurations {
             let full_descriptor = unsafe {
@@ -242,7 +147,7 @@ impl DeviceWithEp0 {
             address: self.address,
             shared: self.shared,
             ctrl_ds_segment: self.ctrl_ds_segment,
-            qh: self.qh,
+            ep0: self.ep0,
             info: DeviceInfo::from_descriptor(&device_descriptor, configurations),
         }
     }
@@ -252,7 +157,7 @@ pub struct DeviceWithInfo {
     address: u7,
     shared: Arc<DeviceSharedState>,
     ctrl_ds_segment: CtrlDsSegment,
-    qh: MappedMem<QhWithMetaA>,
+    ep0: LoadedControlEndpoint,
     info: DeviceInfo,
 }
 
@@ -261,50 +166,9 @@ impl DeviceWithInfo {
         &self.info
     }
 
-    async unsafe fn do_setup_transfer(
-        &mut self,
-        qtds: [MappedMem<Qtd>; 2],
-        setup_buffer: MappedMem<[u8; 8]>,
-    ) {
-        let qh_ptr = unsafe { VolatilePtr::new(self.qh.ptr) };
-        let setup_qtd_ptr = unsafe { VolatilePtr::new(qtds[0].ptr) };
-        let status_qtd_ptr = unsafe { VolatilePtr::new(qtds[1].ptr) };
-        let mut setup_qtd = Qtd::new(
-            TransferToken::new_active(PidCode::SetupToken, u15::new(8)),
-            BufferPtrs::new_contiguous(setup_buffer.phys_addr.into(), 8),
-        );
-        setup_qtd.next_qtd_ptr =
-            NextQtdPointer::new_valid(get_addr_offset(qtds[1].phys_addr, self.ctrl_ds_segment));
-        setup_qtd_ptr.write(setup_qtd);
-        let status_qtd = Qtd::new(
-            TransferToken::new_active(PidCode::InToken, u15::ZERO)
-                .with_data_toggle(true)
-                .with_interrupt_on_complete(true),
-            BufferPtrs::ZERO,
-        );
-        status_qtd_ptr.write(status_qtd);
-        qh_ptr
-            .qh()
-            .next_qtd_pointer()
-            .write(NextQtdPointer::new_valid(get_addr_offset(
-                qtds[0].phys_addr,
-                self.ctrl_ds_segment,
-            )));
-        qh_ptr
-            .qh()
-            .transfer_token()
-            .write(TransferToken::new_with_raw_value(0));
-        loop {
-            if !status_qtd_ptr.qtd_token().read().active() {
-                break;
-            }
-            self.shared.usb_int_signal.wait().await;
-        }
-    }
-
     /// Note that this function takes the *index* of the configuration from the info Vec, not the u8 configuration *number*. This is for efficiency.
     pub async unsafe fn set_configuration(
-        &mut self,
+        mut self,
         configuration_index: usize,
         resources: SetConfigurationResources,
     ) -> ConfiguredDeviceOrHub {
@@ -313,9 +177,14 @@ impl DeviceWithInfo {
         setup_packet_ptr.write(transmute!(SetupPacket::new_set_configuration(
             configuration.number
         )));
-        (unsafe { self.do_setup_transfer(resources.qtds, resources.setup_buffer) }).await;
+        (unsafe {
+            self.ep0
+                .transfer_no_data(resources.setup_buffer, resources.qtds)
+        })
+        .await;
         let configuration = &self.info.configurations[configuration_index];
-        let configuration = Configuration {
+        let configuration = DeviceWithConfigurationSet {
+            endpoint_0: self.ep0,
             interfaces: configuration
                 .interfaces
                 .iter()
@@ -329,11 +198,9 @@ impl DeviceWithInfo {
                                 TransferType::Isochronous => EndpointEnum::Isochronous,
                                 TransferType::Interrupt => {
                                     let shared = Arc::new(InterruptEndpointSharedState::default());
-                                    self.shared.req_signal.signal(DeviceReq::AddEndpoint(
-                                        AddEndpointReq {
-                                            endpoint_shared: shared.clone(),
-                                        },
-                                    ));
+                                    self.shared.req_signal.signal(AddEndpointReq {
+                                        endpoint_shared: shared.clone(),
+                                    });
                                     EndpointEnum::Interrupt(InterruptEndpoint::new(
                                         self.address,
                                         shared,
@@ -362,6 +229,7 @@ impl DeviceWithInfo {
                 panic!("unexpected hub endpoint type");
             };
             ConfiguredDeviceOrHub::Hub(Hub {
+                endpoint_0: configuration.endpoint_0,
                 interrupt_endpoint: ep,
             })
         } else {
@@ -375,7 +243,8 @@ pub struct SetConfigurationResources {
     pub setup_buffer: MappedMem<[u8; 8]>,
 }
 
-pub struct Configuration {
+pub struct DeviceWithConfigurationSet {
+    pub endpoint_0: LoadedControlEndpoint,
     pub interfaces: Vec<Interface>,
 }
 
@@ -391,6 +260,6 @@ pub enum EndpointEnum {
 }
 
 pub enum ConfiguredDeviceOrHub {
-    Device(Configuration),
+    Device(DeviceWithConfigurationSet),
     Hub(Hub),
 }
